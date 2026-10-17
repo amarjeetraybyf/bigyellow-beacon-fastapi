@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 firebase-key.json
 *.db
+*.plan.md
+.venv-verify/

@@ -36,3 +36,47 @@ Swagger UI documentation will be live at: **http://127.0.0.1:8000/docs**
 ```bash
 pytest -v tests/
 ```
+
+## AI Setup (GCP VM / shipboard GPU)
+
+The edge server uses a **local Ollama daemon** plus **faster-whisper** — no cloud AI dependency.
+
+### Required Ollama models
+```bash
+ollama pull gemma3n:e4b      # near-miss structuring + Master morning brief
+ollama pull gemma3n:e2b      # wellbeing check-in chat
+ollama pull gemma3:4b        # vision: photo-only hazard drafts
+ollama pull embeddinggemma   # duplicate-ticket detection
+```
+Verify with `ollama list`.
+
+### AI environment variables (`.env`)
+| Variable | Default | Purpose |
+|---|---|---|
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Local Ollama daemon |
+| `OLLAMA_STRUCTURE_MODEL` | `gemma3n:e4b` | Report structuring + brief |
+| `OLLAMA_CHAT_MODEL` | `gemma3n:e2b` | Check-in chat turns |
+| `OLLAMA_VISION_MODEL` | `gemma3:4b` | Photo-only draft description |
+| `OLLAMA_EMBED_MODEL` | `embeddinggemma` | Duplicate detection embeddings |
+| `OLLAMA_TIMEOUT_SECONDS` | `60` | Per-call timeout |
+| `WHISPER_MODEL_SIZE` | `medium` | faster-whisper model |
+| `WHISPER_DEVICE` | `cuda` | Falls back to `small`/CPU/int8 automatically |
+| `WHISPER_COMPUTE_TYPE` | `float16` | CUDA compute type |
+
+Note: when running under systemd, the service unit must inherit the CUDA library path
+(e.g. the `gpu.conf` drop-in setting `LD_LIBRARY_PATH` for cuBLAS/cuDNN) so Whisper can use the GPU.
+
+### Smoke checks
+```bash
+# 1. Ollama reachable
+curl -s http://127.0.0.1:11434/api/tags | head -c 200
+
+# 2. Report structuring (text draft -> structured fields, not just keyword fallback)
+#    POST /reports/drafts (text=...) then POST /reports/drafts/{id}/structure
+
+# 3. Photo-only draft -> vision description (gemma3:4b)
+# 4. Check-in chat: POST /checkins (mode=chat) then POST /checkins/{id}/turn -> non-scripted reply
+# 5. Voice: POST /checkins/{id}/voice with audio -> real Whisper transcript
+# 6. Master brief: POST /master/brief/regenerate -> response contains "generated_by_model": "ollama"
+```
+With Ollama stopped, all endpoints must still answer using offline heuristics/fallbacks.
