@@ -26,7 +26,8 @@ class OverridePayload(BaseModel):
 
 @router.post("/now")
 async def trigger_sync_now(
-    user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
+    user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
+
     db: Session = Depends(get_db),
 ):
     """Master triggers immediate sync cycle."""

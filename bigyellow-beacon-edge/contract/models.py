@@ -4,7 +4,7 @@ Shared Pydantic v2 Models for BigYellow Beacon Contract
 
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from contract.enums import (
     Role,
@@ -219,16 +219,21 @@ class PairingCodeResponse(BaseModel):
 
 class PairRequest(BaseModel):
     pairing_code: str
-    department: Optional[str] = "Deck"
     crew_id: Optional[str] = None
+    department: Optional[str] = "Deck"
     crew_name: Optional[str] = None
+    pin: Optional[str] = "1234"
 
 
 class PairResponse(BaseModel):
     device_token: str
+    device_id: Optional[str] = None
     vessel_id: str
-    department: str
+    crew_id: Optional[str] = None
+    crew_name: Optional[str] = None
+    department: Optional[str] = "Deck"
     expires_at: datetime
+    token: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -237,6 +242,8 @@ class LoginRequest(BaseModel):
     device_token: Optional[str] = None
     pin: Optional[str] = None
     email: Optional[str] = None
+    crew_id: Optional[str] = None
+    role: Optional[str] = None
 
 
 class TokenResponse(BaseModel):
@@ -250,6 +257,12 @@ class TokenResponse(BaseModel):
     crew_id: Optional[str] = None
     user_id: Optional[str] = None
     user: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def populate_token_alias(self) -> "TokenResponse":
+        if not self.token and self.access_token:
+            self.token = self.access_token
+        return self
 
 
 class UserPreferences(BaseModel):

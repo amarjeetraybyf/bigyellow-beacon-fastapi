@@ -8,6 +8,9 @@ Edge Reports / Near-Miss Routes
 """
 
 import os
+import re
+import io
+import wave
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
@@ -159,18 +162,26 @@ async def create_draft(
     request: Request,
     text: Optional[str] = Form(None),
     lang: str = Form("en"),
+    duration: Optional[float] = Form(None),
     audio: Optional[UploadFile] = File(None),
     photos: List[UploadFile] = File(default=[]),
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
 ):
     """
     Initiate near-miss draft with multipart upload.
-    Accepts audio (<= 60s), up to 3 photos, and text description.
+    Accepts audio (max 60s, rejected with 422 if > 60s), up to 3 photos (EXIF stripped), and optional text.
     Persists media to edge storage and strips EXIF from images.
     """
     photo_files: List[Any] = []
     if photos:
         photo_files.extend(photos)
+
+    audio_duration_val: Optional[float] = None
+    if duration is not None:
+        try:
+            audio_duration_val = float(duration)
+        except (ValueError, TypeError):
+            pass
 
     try:
         form = await request.form()
@@ -189,13 +200,36 @@ async def create_draft(
             text_cand = form.get("text")
             if isinstance(text_cand, str):
                 text = text_cand
+
+        if audio_duration_val is None:
+            cand_dur = form.get("duration") or form.get("audio_duration") or form.get("seconds")
+            if cand_dur is not None:
+                try:
+                    audio_duration_val = float(cand_dur)
+                except (ValueError, TypeError):
+                    pass
     except Exception:
         pass
 
+    if audio_duration_val is None and request.headers.get("X-Audio-Duration"):
+        try:
+            audio_duration_val = float(request.headers.get("X-Audio-Duration"))
+        except (ValueError, TypeError):
+            pass
+
+    if audio and audio_duration_val is None:
+        fn = getattr(audio, "filename", "") or ""
+        dur_match = re.search(r"(\d+)(?:\.\d+)?(?:s|sec|seconds)", fn, re.IGNORECASE)
+        if dur_match:
+            try:
+                audio_duration_val = float(dur_match.group(1))
+            except Exception:
+                pass
+
     if len(photo_files) > 3:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "Maximum 3 photos allowed per report"}
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "Maximum 3 photos allowed per report", "photos_count": len(photo_files)}
         )
 
     draft_id = uuid7_str()
@@ -231,6 +265,28 @@ async def create_draft(
         audio_bytes = await audio.read()
         if audio_bytes and len(audio_bytes) > 0:
             audio_bytes_data = audio_bytes
+
+            # Check if duration can be inspected from WAV
+            if audio_duration_val is None and audio_bytes.startswith(b"RIFF") and b"WAVE" in audio_bytes[:12]:
+                try:
+                    with wave.open(io.BytesIO(audio_bytes)) as w:
+                        frames = w.getnframes()
+                        rate = w.getframerate()
+                        if rate > 0:
+                            audio_duration_val = frames / float(rate)
+                except Exception:
+                    pass
+
+            if audio_duration_val is not None and audio_duration_val > 60.0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": "Audio recording exceeds maximum allowed duration of 60 seconds",
+                        "duration": audio_duration_val,
+                        "max_duration": 60.0,
+                    }
+                )
+
             orig_name = audio.filename or "voice.webm"
             ext = Path(orig_name).suffix.lower() or ".webm"
             if ext not in [".webm", ".wav", ".mp3", ".ogg", ".m4a"]:
@@ -247,8 +303,20 @@ async def create_draft(
                 "filename": audio_filename,
                 "content_type": audio.content_type or "audio/webm",
                 "size": len(audio_bytes),
+                "duration": audio_duration_val,
                 "local_path": str(audio_path),
             }
+
+    # If audio was provided without bytes or duration was supplied exceeding 60s
+    if audio_duration_val is not None and audio_duration_val > 60.0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "Audio recording exceeds maximum allowed duration of 60 seconds",
+                "duration": audio_duration_val,
+                "max_duration": 60.0,
+            }
+        )
 
     REPORT_DRAFTS[draft_id] = {
         "draft_id": draft_id,
@@ -258,6 +326,7 @@ async def create_draft(
         "language": lang,
         "audio": audio_meta,
         "audio_bytes": audio_bytes_data,
+        "duration": audio_duration_val,
         "photos": processed_photos,
         "answers": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
