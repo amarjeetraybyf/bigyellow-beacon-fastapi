@@ -49,6 +49,18 @@ class SSEManager:
 
         return self._counter
 
+    def get_replay_events(self, channel: str, last_event_id: int) -> List[SSEMessage]:
+        return [
+            msg for msg in self._history
+            if msg.channel == channel and msg.event_id > last_event_id
+        ]
+
+    def broadcast_sync_status(self, vessel_id: str, data: Dict[str, Any]) -> None:
+        self.publish(f"vessel:{vessel_id}:master", "sync.status", data)
+        for ch in list(self._subscribers.keys()):
+            if ch != f"vessel:{vessel_id}:master":
+                self.publish(ch, "sync.status", data)
+
     async def subscribe(
         self, channel: str, last_event_id: Optional[int] = None
     ) -> AsyncGenerator[str, None]:

@@ -205,6 +205,26 @@ class PairingCodeModel(Base):
     used = Column(Boolean, default=False, nullable=False)
 
 
+class CrewAccountModel(Base):
+    """
+    Crew member accounts created by Master or seeded on edge.
+    Supports username + password / PIN login.
+    """
+    __tablename__ = "crew_accounts"
+
+    id = Column(String(36), primary_key=True, default=uuid7_str)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    name = Column(String(128), nullable=False)
+    rank = Column(String(64), nullable=False)
+    rank_band = Column(String(32), default="rating", nullable=False)  # officer | rating
+    role = Column(String(32), default="crew", nullable=False)          # crew | master
+    language = Column(String(10), default="en", nullable=False)
+    vessel_id = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
+    created_by = Column(String(64), nullable=True)
+
+
 class InboxMessageModel(Base):
     """
     Edge-only crew inbox notices and notifications.

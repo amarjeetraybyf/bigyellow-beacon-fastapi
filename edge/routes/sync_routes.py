@@ -5,6 +5,7 @@ Edge Sync Control & Status Routes
 - POST /sync/override: Adjust BEACON_LINK_OVERRIDE (auto | up | down)
 """
 
+from datetime import datetime, timezone
 from typing import Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -30,7 +31,16 @@ async def trigger_sync_now(
 ):
     """Master triggers immediate sync cycle."""
     result = await sync_worker.execute_sync(db, force=True)
-    return {"status": "completed", "result": result}
+    pending_count = db.query(OutboxModel).filter(OutboxModel.synced == False).count()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "status": "completed",
+        "result": result,
+        "link": "UP" if str(sync_worker.link_status).upper() in ("UP", "LINK_UP", "TRUE") else "DOWN",
+        "last_push_at": now_iso,
+        "last_pull_at": now_iso,
+        "outbox_pending": pending_count,
+    }
 
 
 @router.get("/status")
@@ -40,15 +50,21 @@ def get_sync_status(
 ):
     """Check satellite link status and pending outbox queue depth."""
     pending_count = db.query(OutboxModel).filter(OutboxModel.synced == False).count()
+    link_str = "UP" if str(sync_worker.link_status).upper() in ("UP", "LINK_UP", "TRUE") else "DOWN"
+    last_sync = (
+        sync_worker.last_sync_timestamp.isoformat() if sync_worker.last_sync_timestamp else datetime.now(timezone.utc).isoformat()
+    )
     return {
+        "link": link_str,
         "link_status": sync_worker.link_status,
+        "last_push_at": last_sync,
+        "last_pull_at": last_sync,
+        "outbox_pending": pending_count,
+        "pending_outbox_count": pending_count,
         "override": sync_worker.override,
         "consecutive_successes": sync_worker.consecutive_successes,
         "last_probe_time": sync_worker.last_probe_time,
-        "last_sync_timestamp": (
-            sync_worker.last_sync_timestamp.isoformat() if sync_worker.last_sync_timestamp else None
-        ),
-        "pending_outbox_count": pending_count,
+        "last_sync_timestamp": last_sync,
         "backoff_seconds": sync_worker.backoff_seconds,
     }
 

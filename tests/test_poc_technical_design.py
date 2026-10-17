@@ -242,6 +242,8 @@ def test_safety_rails_and_welfare_privacy():
 
 def test_k_anonymity_masking_enforcement():
     shore_db = ShoreSessionLocal()
+    shore_db.query(CheckinAggregateModel).delete()
+    shore_db.commit()
     # Insert aggregate with n=3 (violates k>=5) and n=7 (valid)
     sub_k = CheckinAggregateModel(
         id=uuid7_str(),

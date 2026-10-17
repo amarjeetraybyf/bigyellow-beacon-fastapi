@@ -203,14 +203,16 @@ class PairResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
     device_token: Optional[str] = None
     pin: Optional[str] = None
     email: Optional[str] = None
-    password: Optional[str] = None
 
 
 class TokenResponse(BaseModel):
     access_token: str
+    token: Optional[str] = None
     refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: int
@@ -218,6 +220,7 @@ class TokenResponse(BaseModel):
     vessel_id: Optional[str] = None
     crew_id: Optional[str] = None
     user_id: Optional[str] = None
+    user: Optional[Dict[str, Any]] = None
 
 
 class UserPreferences(BaseModel):
