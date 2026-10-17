@@ -1,0 +1,1 @@
+"""BigYellow Beacon FastAPI Package."""
