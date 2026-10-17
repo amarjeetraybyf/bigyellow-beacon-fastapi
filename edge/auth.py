@@ -19,13 +19,17 @@ async def get_current_edge_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer_scheme),
 ) -> Dict[str, Any]:
     auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    token: Optional[str] = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif "token" in request.query_params:
+        token = request.query_params["token"]
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Missing or invalid Authorization header"}
+            detail={"error": "Missing or invalid Authorization header or token query parameter"}
         )
-
-    token = auth_header[7:].strip()
     payload = decode_edge_session_token(token)
     if not payload:
         raise HTTPException(

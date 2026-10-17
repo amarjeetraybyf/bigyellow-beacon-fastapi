@@ -15,6 +15,13 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_edge_db():
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as session:
+        try:
+            from contract.db.models import TicketModel
+            session.query(TicketModel).filter(TicketModel.onboard_status == "NEW").update({"onboard_status": "SUBMITTED"})
+            session.commit()
+        except Exception:
+            session.rollback()
 
 
 def get_db() -> Generator[Session, None, None]:

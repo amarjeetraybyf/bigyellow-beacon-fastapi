@@ -3,13 +3,16 @@ BigYellow Beacon – Edge Server (FastAPI)
 Runs shipboard on mini-PC / Jetson LAN.
 """
 
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from edge.config import PORT, HOST, DEBUG, VESSEL_ID
+
 from edge.db import init_edge_db
 from edge.middleware.idempotency import IdempotencyMiddleware
 from edge.routes.auth_routes import router as auth_router
@@ -58,6 +61,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount Static Files for Uploads and Media
+UPLOADS_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+app.mount("/media", StaticFiles(directory=str(UPLOADS_DIR)), name="media")
+
 # Mount Routes
 app.include_router(auth_router)
 app.include_router(reports_router)
@@ -68,6 +77,7 @@ app.include_router(events_router)
 app.include_router(checkin_router)
 app.include_router(learnings_router)
 app.include_router(sync_router)
+
 
 
 @app.get("/health", tags=["System"])

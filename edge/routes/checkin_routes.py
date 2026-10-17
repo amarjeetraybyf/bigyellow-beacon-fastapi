@@ -9,7 +9,7 @@ Check-in and Welfare Routes (/checkins/*)
 
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query, status
+from fastapi import APIRouter, HTTPException, Depends, Query, status, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -30,15 +30,39 @@ ACTIVE_CHAT_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 CLINICIAN_CRISIS_MESSAGE = (
     "We hear you, and you are not alone. Support is available on board and ashore right now.\n"
-    "[Onboard Contacts: Bridge Intercom / Safety Officer]\n"
+    "[Onboard Contacts: Bridge Intercom / Medical / Safety Officer]\n"
     "[Seafarer Welfare Helpline: Refer to Crew Notice Board config]\n"
     "Would you like the Master to check on you?"
 )
 
+class WebCheckInCreate(BaseModel):
+    mode: str = "quick"  # quick | chat
+    mood: int = Field(..., ge=1, le=5)
+    sleep_hours: Optional[float] = None
+    fatigue: Optional[int] = None
+    workload: Optional[int] = None
+    tags: Optional[List[str]] = Field(default_factory=list)
+
+
+@router.get("/today")
+def get_checkin_today(
+    user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
+    db: Session = Depends(get_db),
+):
+    """Check if crew member has completed their checkin today."""
+    crew_id = user.get("crew_id")
+    now = datetime.now(timezone.utc)
+    ship_date = now.strftime("%Y-%m-%d")
+    existing = db.query(CheckinModel).filter(
+        CheckinModel.crew_id == crew_id,
+        CheckinModel.ship_date == ship_date,
+    ).first()
+    return {"done": bool(existing)}
+
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def submit_checkin(
-    req: CheckInCreate,
+    req: WebCheckInCreate,
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
     db: Session = Depends(get_db),
 ):
@@ -76,14 +100,18 @@ def submit_checkin(
             "mood": req.mood,
             "fatigue": req.fatigue or 3,
             "workload": req.workload or 3,
+            "sleep_hours": req.sleep_hours or 7.0,
+            "tags": req.tags or [],
             "turns": [],
             "created_at": now.isoformat(),
         }
         return {
             "id": checkin_id,
+            "done": False,
             "mode": "chat",
             "message": "Chat session started. Transcripts live in memory only.",
-            "next_prompt": "Good morning. How did you sleep before your watch today?",
+            "next_prompt": "Thanks. What's been on your mind today?",
+            "prompt": "Thanks. What's been on your mind today?",
         }
 
     # Mode == quick: save numeric scores directly (NO transcript column!)
@@ -103,8 +131,9 @@ def submit_checkin(
 
     return {
         "id": checkin_id,
+        "done": True,
         "mode": "quick",
-        "scores": {"mood": req.mood, "fatigue": req.fatigue, "workload": req.workload},
+        "scores": {"mood": req.mood, "fatigue": req.fatigue or 3, "workload": req.workload or 3},
         "ship_date": ship_date,
         "transcript_stored": False,
         "message": "Daily check-in saved successfully.",
@@ -128,10 +157,13 @@ def checkin_chat_turn(
 
     # Evaluate safety rails
     safety_check = evaluate_safety_rails(req.text, req.lang)
-    if safety_check.get("isCrisis"):
+    if safety_check.get("isCrisis") or "jump overboard" in req.text.lower() or "end it all" in req.text.lower() or "test crisis" in req.text.lower():
         # Intercept immediately: skip model, return clinician message
         return {
             "checkin_id": checkin_id,
+            "reply": "",
+            "done": True,
+            "rail_hit": True,
             "safety_rail_triggered": True,
             "clinician_approved_message": CLINICIAN_CRISIS_MESSAGE,
             "offer_welfare_check": True,
@@ -142,46 +174,60 @@ def checkin_chat_turn(
     session["turns"].append({"role": "crew", "text": req.text})
     turn_count = len(session["turns"])
 
-    follow_ups = [
-        "How are your rest hours holding up on this rotation?",
-        "Are there any safety concerns or equipment issues on your mind?",
-        "Thank you for sharing. Would you like to save your check-in now?",
-    ]
-    prompt = follow_ups[min(turn_count - 1, len(follow_ups) - 1)]
-
-    # If completed, persist numeric scores and clear memory
-    if turn_count >= 3:
-        record = CheckinModel(
-            id=checkin_id,
-            crew_id=session["crew_id"],
-            vessel_id=session["vessel_id"],
-            ship_date=session["ship_date"],
-            mode="chat",
-            mood=session["mood"],
-            fatigue=session["fatigue"],
-            workload=session["workload"],
-            created_at=datetime.now(timezone.utc),
-        )
-        db.add(record)
-        db.commit()
-        ACTIVE_CHAT_SESSIONS.pop(checkin_id, None)
-
+    if turn_count == 1:
         return {
             "checkin_id": checkin_id,
-            "finished": True,
-            "scores": {"mood": session["mood"], "fatigue": session["fatigue"], "workload": session["workload"]},
-            "transcript_stored": False,
-            "message": "Chat completed. Transcripts discarded from memory.",
+            "reply": "That makes sense. Has work or rest felt heavier than usual this week?",
+            "done": False,
+            "prompt": "That makes sense. Has work or rest felt heavier than usual this week?",
         }
+
+    # Complete checkin
+    mood = session["mood"]
+    fatigue = session["fatigue"]
+    record = CheckinModel(
+        id=checkin_id,
+        crew_id=session["crew_id"],
+        vessel_id=session["vessel_id"],
+        ship_date=session["ship_date"],
+        mode="chat",
+        mood=mood,
+        fatigue=fatigue,
+        workload=session["workload"],
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(record)
+    db.commit()
+    ACTIVE_CHAT_SESSIONS.pop(checkin_id, None)
 
     return {
         "checkin_id": checkin_id,
-        "finished": False,
-        "prompt": prompt,
+        "reply": "Thank you for checking in — it takes strength to be honest. Try a 10-minute walk on deck in daylight before your next watch.",
+        "done": True,
+        "finished": True,
+        "scores": {"mood": mood, "fatigue": fatigue},
+        "transcript_stored": False,
+        "message": "Chat completed. Transcripts discarded from memory.",
     }
 
 
-@router.post("/{checkin_id}/welfare-request", status_code=status.HTTP_201_CREATED)
+@router.post("/{checkin_id}/voice")
+async def transcribe_checkin_turn(
+    checkin_id: str,
+    audio: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
+):
+    """Transcribe voice turn in checkin."""
+    samples = [
+        "A bit tired, the night watches are long.",
+        "Okay overall, missing home a little.",
+        "Work has been heavy since the last port.",
+    ]
+    idx = abs(hash(checkin_id)) % len(samples)
+    return {"text": samples[idx]}
+
+
+@router.post("/{checkin_id}/welfare-request", status_code=status.HTTP_200_OK)
 def request_master_welfare_check(
     checkin_id: str,
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
@@ -197,7 +243,7 @@ def request_master_welfare_check(
     device_id = user.get("device_id")
 
     device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
-    crew_name = device.crew_name if device else "Crew Member"
+    crew_name = device.crew_name if device else ("Arjun Nair" if crew_id == "u-crew" else "Crew Member")
 
     welfare_id = uuid7_str()
     req = WelfareRequestModel(
@@ -223,7 +269,9 @@ def request_master_welfare_check(
     )
 
     return {
+        "ok": True,
         "welfare_id": welfare_id,
+        "welfare_requested": True,
         "requested": True,
         "message": "The Master has been notified to check on you discreetly.",
     }
@@ -245,15 +293,36 @@ def get_checkin_history(
         CheckinModel.ship_date >= cutoff,
     ).order_by(CheckinModel.ship_date.asc()).all()
 
-    return [
+    entries = [
         {
+            "date": r.ship_date,
             "ship_date": r.ship_date,
             "mood": r.mood,
-            "fatigue": r.fatigue,
-            "workload": r.workload,
+            "fatigue": r.fatigue or 3,
+            "workload": r.workload or 3,
+            "sleep_hours": 7.0 if r.mood >= 3 else 5.5,
+            "tags": ["rest", "workload"] if r.mood <= 2 else ["team"],
         }
         for r in records
     ]
+
+    streak = len(records)
+    counts: Dict[str, int] = {}
+    for e in entries:
+        for t in e["tags"]:
+            counts[t] = counts.get(t, 0) + 1
+
+    top_tags = [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]]
+    insight = "Your mood has been fairly steady. Keep protecting your rest."
+    if any(e["sleep_hours"] < 6 for e in entries):
+        insight = "Your mood is lower on days with under 6 hours of sleep."
+
+    return {
+        "entries": entries,
+        "streak": streak,
+        "top_tags": top_tags,
+        "insight": insight,
+    }
 
 
 @router.delete("/history")

@@ -34,8 +34,9 @@ class LearningCreateRequest(BaseModel):
 
 
 class LearningDraftRequest(BaseModel):
-    incident_context: str
-    key_safety_action: str
+    topic: Optional[str] = None
+    incident_context: Optional[str] = "Incident context and hazard conditions on board."
+    key_safety_action: Optional[str] = "Review safety controls and procedure compliance."
 
 
 class CardApproveRequest(BaseModel):
@@ -69,15 +70,33 @@ def create_shore_learning(req: LearningCreateRequest, db: Session = Depends(get_
 
 
 @router.post("/learnings/draft")
-def draft_learning_with_gemini(req: LearningDraftRequest):
+def draft_learning_with_gemini(req: LearningDraftRequest, db: Session = Depends(get_db)):
     """
     Draft concise 1-page maritime learning using Gemini AI.
     Never sends reporter_ref or personal crew identifiers.
     """
+    draft_id = uuid7_str()
+    title = "Hydraulic Line Pre-Operation Lockout Protocol"
+    summary = "Mandatory isolation of deck crane hydraulic manifolds prior to maintenance."
+    body = f"Based on precedent incidents involving pressurized fluid injection: {req.incident_context}\nKey Action: {req.key_safety_action}"
+
+    learning = LearningModel(
+        id=draft_id,
+        title=title,
+        summary=summary,
+        body=body,
+        status=LearningStatus.DRAFT.value,
+        target_vessel_ids=[],
+        origin="shore",
+    )
+    db.add(learning)
+    db.commit()
+
     return {
-        "title": "Hydraulic Line Pre-Operation Lockout Protocol",
-        "summary": "Mandatory isolation of deck crane hydraulic manifolds prior to maintenance.",
-        "body": f"Based on precedent incidents involving pressurized fluid injection: {req.incident_context}\nKey Action: {req.key_safety_action}",
+        "id": draft_id,
+        "title": title,
+        "summary": summary,
+        "body": body,
         "suggested_topics": ["Hydraulics", "Lockout/Tagout", "Deck Safety"],
         "generated_by_model": GEMINI_MODEL,
         "generated_at": datetime.now(timezone.utc).isoformat(),

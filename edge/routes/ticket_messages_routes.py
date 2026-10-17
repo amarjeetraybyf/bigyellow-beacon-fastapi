@@ -4,7 +4,8 @@ Queued to outbox for satellite sync to shore reviewer.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,11 @@ from edge.services.pii_scrub import scrub_pii
 from edge.services.sse_manager import sse_manager
 
 router = APIRouter(prefix="/tickets", tags=["Ticket Anonymous Thread"])
+
+
+class WebTicketMessageCreate(BaseModel):
+    text: Optional[str] = None
+    body: Optional[str] = None
 
 
 @router.get("/{ticket_id}/messages")
@@ -34,13 +40,25 @@ def list_ticket_messages(
     messages = db.query(TicketMessageModel).filter(
         TicketMessageModel.ticket_id == ticket_id
     ).order_by(TicketMessageModel.created_at.asc()).all()
-    return messages
+
+    return [
+        {
+            "id": m.id,
+            "ticket_id": m.ticket_id,
+            "sender": "master" if m.sender_role == "master" else ("shore" if "shore" in m.sender_role else "reporter"),
+            "sender_role": m.sender_role,
+            "body": m.text,
+            "text": m.text,
+            "created_at": m.created_at.isoformat() if m.created_at else datetime.now(timezone.utc).isoformat(),
+        }
+        for m in messages
+    ]
 
 
 @router.post("/{ticket_id}/messages", status_code=status.HTTP_201_CREATED)
 def post_ticket_message(
     ticket_id: str,
-    req: TicketMessageCreate,
+    req: WebTicketMessageCreate,
     user: Dict[str, Any] = Depends(get_current_edge_user),
     db: Session = Depends(get_db),
 ):
@@ -49,15 +67,18 @@ def post_ticket_message(
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
+    raw_text = req.body or req.text or ""
     msg_id = uuid7_str()
-    scrubbed_text = scrub_pii(req.text)
-    sender_role = user.get("role", "crew")
+    scrubbed_text = scrub_pii(raw_text)
+    user_role = user.get("role", "crew")
+    sender_role = "master" if user_role == Role.MASTER or user_role == "master" else "crew"
 
     msg = TicketMessageModel(
         id=msg_id,
         ticket_id=ticket_id,
         sender_role=sender_role,
         text=scrubbed_text,
+        created_at=datetime.now(timezone.utc),
     )
 
     outbox = OutboxModel(
@@ -80,10 +101,42 @@ def post_ticket_message(
     db.add(outbox)
     db.commit()
 
+    sse_sender = "master" if sender_role == "master" else "reporter"
     sse_manager.publish(
         channel=f"vessel:{ticket.vessel_id}:master",
         event_type=SSEEvent.MESSAGE_NEW.value,
-        data={"ticket_id": ticket_id, "message_id": msg_id, "sender_role": sender_role},
+        data={
+            "id": msg_id,
+            "ticket_id": ticket_id,
+            "message_id": msg_id,
+            "sender": sse_sender,
+            "sender_role": sender_role,
+            "body": scrubbed_text,
+            "created_at": msg.created_at.isoformat(),
+        },
     )
 
-    return msg
+    return {
+        "id": msg.id,
+        "ticket_id": ticket_id,
+        "sender": sse_sender,
+        "sender_role": sender_role,
+        "body": scrubbed_text,
+        "text": scrubbed_text,
+        "created_at": msg.created_at.isoformat(),
+    }
+
+
+@router.get("/{ticket_id}")
+def get_ticket_by_id(
+    ticket_id: str,
+    user: Dict[str, Any] = Depends(get_current_edge_user),
+    db: Session = Depends(get_db),
+):
+    """Get single ticket detail by ID."""
+    ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
+    from edge.routes.reports_routes import ticket_to_dict
+    return ticket_to_dict(ticket)
+

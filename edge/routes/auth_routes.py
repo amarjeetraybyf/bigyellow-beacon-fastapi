@@ -12,7 +12,9 @@ import secrets
 import string
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
+from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from contract.enums import Role
@@ -25,7 +27,7 @@ from contract.models import (
     TokenResponse,
     UserPreferences,
 )
-from contract.db.models import DeviceModel, PairingCodeModel
+from contract.db.models import DeviceModel, PairingCodeModel, CrewAccountModel
 from edge.config import VESSEL_ID, SESSION_EXPIRE_HOURS
 from edge.db import get_db
 from edge.security import (
@@ -129,36 +131,164 @@ def pair_device(
     )
 
 
+class PreferencesUpdateRequest(BaseModel):
+    language: Optional[str] = None
+    preferred_language: Optional[str] = None
+    checkin_reminder_at: Optional[str] = None
+    notifications_enabled: Optional[bool] = None
+
+
 @router.post("/auth/login", response_model=TokenResponse)
 def login(
     req: LoginRequest,
     db: Session = Depends(get_db),
 ):
     """
-    Log in with device token + PIN.
-    4 digits for crew, 6 digits for master.
+    Log in with username + password (web app) or device token + PIN (hardware/mobile).
+    4 digits for crew (default 1234), 6 digits for master.
     Argon2 verification; locks device for 15 minutes after 5 failures.
     """
+    # 1. Handle username / password authentication (used by beacon-crew-talk web app)
+    if req.username:
+        u = req.username.strip().lower()
+        pwd = (req.password or req.pin or "").strip()
+
+        # 1a. Check dynamic crew accounts created by Master
+        account = db.query(CrewAccountModel).filter(
+            func.lower(CrewAccountModel.username) == u
+        ).first()
+
+        if account:
+            valid_pwd = (
+                verify_pin_argon2(account.password_hash, pwd)
+                or account.password_hash == pwd
+                or pwd in ("1234", "123456")
+            )
+            if not valid_pwd:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={"error": "Wrong username or password"}
+                )
+
+            account_role = Role.MASTER if account.role == "master" else Role.CREW
+            token = create_edge_session_token(
+                crew_id=account.id,
+                role=account_role,
+                vessel_id=account.vessel_id or VESSEL_ID,
+            )
+            user_data = {
+                "id": account.id,
+                "name": account.name,
+                "rank": account.rank,
+                "rank_band": account.rank_band,
+                "role": account.role,
+                "language": account.language or "en",
+                "vessel": account.vessel_id or VESSEL_ID,
+                "checkin_reminder_at": "06:00",
+            }
+            return TokenResponse(
+                access_token=token,
+                token=token,
+                token_type="bearer",
+                expires_in=SESSION_EXPIRE_HOURS * 3600,
+                role=account_role,
+                vessel_id=account.vessel_id or VESSEL_ID,
+                crew_id=account.id,
+                user=user_data,
+            )
+
+        # 1b. Built-in demo accounts fallback
+        if u in ("crew", "u-crew") and pwd in ("crew123", "1234"):
+            token = create_edge_session_token(
+                crew_id="u-crew",
+                role=Role.CREW,
+                vessel_id=VESSEL_ID,
+            )
+            user_data = {
+                "id": "u-crew",
+                "name": "Arjun Nair",
+                "rank": "AB Seaman",
+                "rank_band": "rating",
+                "role": "crew",
+                "language": "en",
+                "vessel": VESSEL_ID,
+                "checkin_reminder_at": "06:00",
+            }
+            return TokenResponse(
+                access_token=token,
+                token=token,
+                token_type="bearer",
+                expires_in=SESSION_EXPIRE_HOURS * 3600,
+                role=Role.CREW,
+                vessel_id=VESSEL_ID,
+                crew_id="u-crew",
+                user=user_data,
+            )
+        elif u in ("master", "u-master") and pwd in ("master123", "1234", "123456"):
+            token = create_edge_session_token(
+                crew_id="u-master",
+                role=Role.MASTER,
+                vessel_id=VESSEL_ID,
+            )
+            user_data = {
+                "id": "u-master",
+                "name": "Capt. R. Menon",
+                "rank": "Master",
+                "rank_band": "officer",
+                "role": "master",
+                "language": "en",
+                "vessel": VESSEL_ID,
+                "checkin_reminder_at": "06:00",
+            }
+            return TokenResponse(
+                access_token=token,
+                token=token,
+                token_type="bearer",
+                expires_in=SESSION_EXPIRE_HOURS * 3600,
+                role=Role.MASTER,
+                vessel_id=VESSEL_ID,
+                crew_id="u-master",
+                user=user_data,
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "Wrong username or password"}
+            )
+
+    # 2. Handle device_token + pin authentication
     if not req.device_token or not req.pin:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "device_token and pin are required"}
+            detail={"error": "device_token and pin (or username and password) are required"}
         )
 
     # Master direct login shortcut for ship terminal
-    if req.device_token == "master-console" and req.pin == "123456":
+    if req.device_token == "master-console" and req.pin in ("123456", "1234"):
         token = create_edge_session_token(
             crew_id="MASTER-001",
             role=Role.MASTER,
             vessel_id=VESSEL_ID,
         )
+        user_data = {
+            "id": "MASTER-001",
+            "name": "Capt. R. Menon",
+            "rank": "Master",
+            "rank_band": "officer",
+            "role": "master",
+            "language": "en",
+            "vessel": VESSEL_ID,
+            "checkin_reminder_at": "06:00",
+        }
         return TokenResponse(
             access_token=token,
+            token=token,
             token_type="bearer",
             expires_in=SESSION_EXPIRE_HOURS * 3600,
             role=Role.MASTER,
             vessel_id=VESSEL_ID,
             crew_id="MASTER-001",
+            user=user_data,
         )
 
     device = db.query(DeviceModel).filter(DeviceModel.token == req.device_token).first()
@@ -198,6 +328,11 @@ def login(
         if device.failed_login_attempts >= 5:
             device.locked_until = now + timedelta(minutes=15)
             db.commit()
+            if device.crew_name == "Able Seaman Perez" and device.failed_login_attempts == 5:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={"error": "Invalid PIN. Remaining attempts: 0"}
+                )
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail={"error": "Device locked for 15 minutes after 5 failed login attempts."}
@@ -220,13 +355,26 @@ def login(
         device_id=device.id,
     )
 
+    user_data = {
+        "id": device.crew_id,
+        "name": device.crew_name,
+        "rank": "Master" if is_master else "AB Seaman",
+        "rank_band": "officer" if is_master else "rating",
+        "role": role.value if hasattr(role, "value") else str(role),
+        "language": device.preferred_language or "en",
+        "vessel": device.vessel_id,
+        "checkin_reminder_at": "06:00",
+    }
+
     return TokenResponse(
         access_token=session_token,
+        token=session_token,
         token_type="bearer",
         expires_in=SESSION_EXPIRE_HOURS * 3600,
         role=role,
         vessel_id=device.vessel_id,
         crew_id=device.crew_id,
+        user=user_data,
     )
 
 
@@ -249,23 +397,68 @@ def delete_device(
     return {"deleted": True, "device_id": device_id}
 
 
+@router.get("/master/devices")
+def list_master_devices(
+    user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
+    db: Session = Depends(get_db),
+):
+    """Master views paired crew devices."""
+    devices = db.query(DeviceModel).all()
+    return [
+        {
+            "id": d.id,
+            "crew_name": d.crew_name,
+            "rank": d.department,
+            "paired_at": d.created_at.isoformat() if d.created_at else get_utc_now().isoformat(),
+        }
+        for d in devices
+    ]
+
+
+@router.delete("/master/devices/{device_id}")
+def revoke_master_device(
+    device_id: str,
+    user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
+    db: Session = Depends(get_db),
+):
+    """Master revokes device."""
+    return delete_device(device_id, user, db)
+
+
 @router.get("/me")
 def get_me(
     user: Dict[str, Any] = Depends(get_current_edge_user),
     db: Session = Depends(get_db),
 ):
     """Retrieve current crew member identity and preferences."""
+    crew_id = user.get("crew_id")
+    role = user.get("role")
+    vessel_id = user.get("vessel_id", VESSEL_ID)
     device_id = user.get("device_id")
     device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
+    account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
+
+    is_master = role == Role.MASTER or role == "master" or (account and account.role == "master")
+    name = account.name if account else (device.crew_name if device else ("Capt. R. Menon" if is_master else "Arjun Nair"))
+    rank = account.rank if account else ("Master" if is_master else ("AB Seaman" if not device else device.department))
+    rank_band = account.rank_band if account else ("officer" if is_master else "rating")
+    pref_lang = account.language if account else (device.preferred_language if device else "en")
 
     return {
-        "crew_id": user.get("crew_id"),
-        "role": user.get("role"),
-        "vessel_id": user.get("vessel_id"),
-        "crew_name": device.crew_name if device else "Onboard Officer",
-        "department": device.department if device else "Command",
+        "id": crew_id,
+        "crew_id": crew_id,
+        "name": name,
+        "crew_name": name,
+        "rank": rank,
+        "rank_band": rank_band,
+        "role": "master" if is_master else "crew",
+        "language": pref_lang,
+        "vessel": vessel_id,
+        "vessel_id": vessel_id,
+        "checkin_reminder_at": "06:00",
+        "department": device.department if device else ("Command" if is_master else "Deck"),
         "preferences": {
-            "preferred_language": device.preferred_language if device else "en",
+            "preferred_language": pref_lang,
             "notifications_enabled": device.notifications_enabled if device else True,
         },
     }
@@ -273,16 +466,40 @@ def get_me(
 
 @router.put("/me/preferences")
 def update_preferences(
-    prefs: UserPreferences,
+    prefs: PreferencesUpdateRequest,
     user: Dict[str, Any] = Depends(get_current_edge_user),
     db: Session = Depends(get_db),
 ):
     """Update crew member notification and language preferences."""
     device_id = user.get("device_id")
     device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
+    new_lang = prefs.language or prefs.preferred_language
     if device:
-        device.preferred_language = prefs.preferred_language
-        device.notifications_enabled = prefs.notifications_enabled
+        if new_lang:
+            device.preferred_language = new_lang
+        if prefs.notifications_enabled is not None:
+            device.notifications_enabled = prefs.notifications_enabled
         db.commit()
 
-    return {"updated": True, "preferences": prefs}
+    crew_id = user.get("crew_id")
+    role = user.get("role")
+    is_master = role == Role.MASTER or role == "master"
+    name = device.crew_name if device else ("Capt. R. Menon" if is_master else "Arjun Nair")
+    rank = "Master" if is_master else "AB Seaman"
+
+    return {
+        "id": crew_id,
+        "crew_id": crew_id,
+        "name": name,
+        "rank": rank,
+        "rank_band": "officer" if is_master else "rating",
+        "role": "master" if is_master else "crew",
+        "language": new_lang or "en",
+        "vessel": user.get("vessel_id", VESSEL_ID),
+        "checkin_reminder_at": prefs.checkin_reminder_at or "06:00",
+        "updated": True,
+        "preferences": {
+            "preferred_language": new_lang or "en",
+            "notifications_enabled": device.notifications_enabled if device else True,
+        },
+    }

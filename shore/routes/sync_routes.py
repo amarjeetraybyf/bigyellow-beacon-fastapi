@@ -145,6 +145,7 @@ async def push_sync_delta(
                         version=int(payload.get("version", 1)),
                     )
                     db.add(ticket)
+                    db.flush()
                 else:
                     # Update respecting FIELD OWNERSHIP:
                     # Edge owns onboard_status, assigned_action, immediate_action
@@ -158,6 +159,7 @@ async def push_sync_delta(
                     if "media_refs" in payload:
                         ticket.media_refs = payload["media_refs"]
                     ticket.version += 1
+                    db.flush()
 
             elif event_type in ("ticket.message", "message.new"):
                 msg_id = ev.aggregate_id or payload.get("id")
@@ -171,6 +173,7 @@ async def push_sync_delta(
                         origin="edge",
                     )
                     db.add(new_msg)
+                    db.flush()
 
             elif event_type == "checkin.aggregate":
                 # k >= 5 masking strictly enforced before saving
@@ -188,6 +191,7 @@ async def push_sync_delta(
                         origin="edge",
                     )
                     db.add(agg)
+                    db.flush()
 
             # Record deduplication entry
             processed = ProcessedEventModel(
@@ -195,6 +199,7 @@ async def push_sync_delta(
                 vessel_id=vessel.id,
             )
             db.add(processed)
+            db.flush()
             acked_ids.append(event_id)
 
         except Exception as e:

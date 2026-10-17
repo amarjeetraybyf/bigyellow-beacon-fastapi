@@ -20,14 +20,19 @@ class Origin(str, Enum):
 
 class OnboardStatus(str, Enum):
     NEW = "NEW"
+    SUBMITTED = "SUBMITTED"
     ACKNOWLEDGED = "ACKNOWLEDGED"
     ACTION_ASSIGNED = "ACTION_ASSIGNED"
+    ACTIONED = "ACTIONED"
+    ACTION_IN_PROGRESS = "ACTION_IN_PROGRESS"
     RESOLVED = "RESOLVED"
+    RESOLVED_ON_BOARD = "RESOLVED_ON_BOARD"
     CLOSED = "CLOSED"
 
 
 class ShoreStatus(str, Enum):
     DRAFT = "DRAFT"
+    QUEUED = "QUEUED"
     NEW = "NEW"
     IN_REVIEW = "IN_REVIEW"
     ACCEPTED = "ACCEPTED"

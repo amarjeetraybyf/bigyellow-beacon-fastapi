@@ -38,17 +38,21 @@ def scrub_pii(text: str, roster_names: Optional[List[str]] = None) -> str:
 def strip_exif(image_bytes: bytes) -> bytes:
     """
     Strips EXIF and GPS geolocation metadata from JPEG/PNG images.
-    Falls back gracefully if PIL is not installed.
+    Falls back gracefully if PIL is not installed or error occurs.
     """
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(image_bytes))
+        fmt = (img.format or "JPEG").upper()
+        if fmt in ("JPEG", "JPG") and img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
         data = list(img.getdata())
         image_without_exif = Image.new(img.mode, img.size)
         image_without_exif.putdata(data)
         out = io.BytesIO()
-        image_without_exif.save(out, format=img.format or "JPEG")
+        image_without_exif.save(out, format=fmt if fmt in ("JPEG", "PNG", "WEBP") else "JPEG")
         return out.getvalue()
     except Exception:
         # If PIL not available or not an image, return original bytes
         return image_bytes
+

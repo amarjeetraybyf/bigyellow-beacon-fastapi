@@ -18,6 +18,7 @@ from fastapi import Request, HTTPException, Header, Depends, status
 from sqlalchemy.orm import Session
 
 from contract.enums import Role
+from edge.security import compute_sync_hmac, verify_sync_hmac
 from contract.db.models import VesselModel, ShoreUserModel
 from shore.config import (
     JWT_SECRET_KEY,
