@@ -536,3 +536,138 @@ def test_bulkhead_qr_pair_and_device_login():
     )
     assert json_qr_res.status_code == 201
     assert "device_token" in json_qr_res.json()
+
+
+def test_api_v1_auth_login_spec():
+    """
+    Verifies userflow 2 requirements:
+    1. POST /api/v1/auth/login
+    2. Response includes 'token' field alias alongside 'access_token'
+    3. User profile includes rank_band ('Officer' | 'Rating') and vessel
+    4. Crew PIN is 4 digits, Master PIN is 6 digits
+    5. Argon2 lockout after 5 failed attempts with 15-minute lock
+    """
+    # 1. Test POST /api/v1/auth/login for Crew (username + password)
+    crew_res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "crew", "password": "1234"},
+    )
+    assert crew_res.status_code == 200
+    crew_data = crew_res.json()
+    assert "token" in crew_data
+    assert "access_token" in crew_data
+    assert crew_data["token"] == crew_data["access_token"]
+    assert "user" in crew_data
+    user_c = crew_data["user"]
+    assert user_c["rank_band"] in ("Officer", "Rating")
+    assert user_c["rank_band"] == "Rating"
+    assert "vessel" in user_c
+    assert user_c["vessel"] == "MV-PACIFIC-STAR"
+
+    # 2. Test POST /api/v1/auth/login for Master (username + password)
+    master_res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "master", "password": "1234"},
+    )
+    assert master_res.status_code == 200
+    master_data = master_res.json()
+    assert master_data["token"] == master_data["access_token"]
+    user_m = master_data["user"]
+    assert user_m["rank_band"] in ("Officer", "Rating")
+    assert user_m["rank_band"] == "Officer"
+    assert "vessel" in user_m
+    assert user_m["vessel"] == "MV-PACIFIC-STAR"
+
+    # 3. Test Master device pairing and 6-digit PIN rule
+    master_pair = client.post(
+        "/api/v1/auth/pair",
+        json={
+            "pairing_code": "BEACON-QR-MV-PACIFIC-STAR",
+            "crew_id": "u-master",
+            "department": "Bridge",
+            "crew_name": "Capt. R. Menon",
+            "pin": "123456",
+        },
+    )
+    assert master_pair.status_code == 201
+    m_dev_token = master_pair.json()["device_token"]
+
+    # Master device requires exactly 6 digits
+    bad_master_pin = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": m_dev_token, "pin": "1234"},
+    )
+    assert bad_master_pin.status_code == 400
+    assert "6 digits" in bad_master_pin.json()["error"]
+
+    # Master login with correct 6-digit PIN
+    good_master_pin = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": m_dev_token, "pin": "123456"},
+    )
+    assert good_master_pin.status_code == 200
+    m_profile = good_master_pin.json()["user"]
+    assert m_profile["rank_band"] == "Officer"
+    assert "vessel" in m_profile
+    assert good_master_pin.json()["token"] is not None
+
+    # 4. Test Crew device pairing and 4-digit PIN rule
+    crew_pair = client.post(
+        "/api/v1/auth/pair",
+        json={
+            "pairing_code": "BEACON-QR-MV-PACIFIC-STAR",
+            "crew_id": "CRW-TEST-LOCKOUT",
+            "department": "Deck",
+            "pin": "8888",
+        },
+    )
+    assert crew_pair.status_code == 201
+    c_dev_token = crew_pair.json()["device_token"]
+
+    # Crew device requires exactly 4 digits (fails on 6 digits)
+    bad_len = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": c_dev_token, "pin": "888888"},
+    )
+    assert bad_len.status_code == 400
+    assert "4 digits" in bad_len.json()["error"]
+
+    # 5. Lockout after 5 failed attempts
+    for attempt in range(1, 5):
+        fail_res = client.post(
+            "/api/v1/auth/login",
+            json={"device_token": c_dev_token, "pin": "0000"},
+        )
+        assert fail_res.status_code == 401
+        assert f"Remaining attempts: {5 - attempt}" in fail_res.json()["error"]
+
+    # 5th failed attempt locks for 15 minutes
+    lock_res = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": c_dev_token, "pin": "0000"},
+    )
+    assert lock_res.status_code == 423
+    assert "locked for 15 minutes" in lock_res.json()["error"]
+
+    # 6. Test default onboard hardware terminals (crew-tablet & master-console)
+    # Crew tablet success (4 digits)
+    ct_ok = client.post("/api/v1/auth/login", json={"device_token": "crew-tablet", "pin": "1234"})
+    assert ct_ok.status_code == 200
+    assert ct_ok.json()["user"]["name"] == "Arjun Nair"
+    assert ct_ok.json()["user"]["rank_band"] == "Rating"
+
+    # Crew tablet bad length (6 digits rejected)
+    ct_bad = client.post("/api/v1/auth/login", json={"device_token": "crew-tablet", "pin": "123456"})
+    assert ct_bad.status_code == 400
+    assert "4 digits" in ct_bad.json()["error"]
+
+    # Master console success (6 digits)
+    mc_ok = client.post("/api/v1/auth/login", json={"device_token": "master-console", "pin": "123456"})
+    assert mc_ok.status_code == 200
+    assert mc_ok.json()["user"]["name"] == "Capt. R. Menon"
+    assert mc_ok.json()["user"]["rank_band"] == "Officer"
+
+    # Master console bad length (4 digits rejected)
+    mc_bad = client.post("/api/v1/auth/login", json={"device_token": "master-console", "pin": "1234"})
+    assert mc_bad.status_code == 400
+    assert "6 digits" in mc_bad.json()["error"]

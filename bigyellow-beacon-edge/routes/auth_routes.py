@@ -222,6 +222,7 @@ class PreferencesUpdateRequest(BaseModel):
 
 
 @router.post("/auth/login", response_model=TokenResponse)
+@router.post("/api/v1/auth/login", response_model=TokenResponse)
 def login(
     req: LoginRequest,
     db: Session = Depends(get_db),
@@ -230,11 +231,33 @@ def login(
     Log in with username + password (web app) or device token + PIN (hardware/mobile).
     4 digits for crew (default 1234), 6 digits for master.
     Argon2 verification; locks device for 15 minutes after 5 failures.
+    Returns access_token and token alias, rank_band ('Officer' | 'Rating'), and vessel.
     """
+    # 0. Normalize aliases: crew_id -> username, role -> device_token
+    if not req.username and req.crew_id:
+        req.username = req.crew_id
+    if not req.device_token and not req.username and req.role:
+        req.device_token = "master-console" if req.role.lower() == "master" else "crew-tablet"
+
     # 1. Handle username / password authentication
     if req.username:
         u = req.username.strip().lower()
         pwd = (req.password or req.pin or "").strip()
+
+        # If pure numeric PIN is provided, validate expected length (4 crew, 6 master)
+        if req.pin and req.pin.isdigit():
+            is_m = u in ("master", "u-master")
+            if not is_m:
+                chk = db.query(CrewAccountModel).filter(func.lower(CrewAccountModel.username) == u).first()
+                if chk and chk.role == "master":
+                    is_m = True
+            expected_len = 6 if is_m else 4
+            if len(req.pin) != expected_len:
+                role_label = "Master" if is_m else "Crew"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": f"{role_label} PIN must be exactly {expected_len} digits"}
+                )
 
         account = db.query(CrewAccountModel).filter(
             func.lower(CrewAccountModel.username) == u
@@ -253,6 +276,7 @@ def login(
                 )
 
             account_role = Role.MASTER if account.role == "master" else Role.CREW
+            is_officer = account_role == Role.MASTER or (account.rank_band or "").lower() == "officer"
             token = create_edge_session_token(
                 crew_id=account.id,
                 role=account_role,
@@ -262,7 +286,7 @@ def login(
                 "id": account.id,
                 "name": account.name,
                 "rank": account.rank,
-                "rank_band": account.rank_band,
+                "rank_band": "Officer" if is_officer else "Rating",
                 "role": account.role,
                 "language": account.language or "en",
                 "vessel": account.vessel_id or VESSEL_ID,
@@ -289,7 +313,7 @@ def login(
                 "id": "u-crew",
                 "name": "Arjun Nair",
                 "rank": "AB Seaman",
-                "rank_band": "rating",
+                "rank_band": "Rating",
                 "role": "crew",
                 "language": "en",
                 "vessel": VESSEL_ID,
@@ -315,7 +339,7 @@ def login(
                 "id": "u-master",
                 "name": "Capt. R. Menon",
                 "rank": "Master",
-                "rank_band": "officer",
+                "rank_band": "Officer",
                 "role": "master",
                 "language": "en",
                 "vessel": VESSEL_ID,
@@ -344,32 +368,45 @@ def login(
             detail={"error": "device_token and pin (or username and password) are required"}
         )
 
-    if req.device_token == "master-console" and req.pin in ("123456", "1234"):
-        token = create_edge_session_token(
-            crew_id="MASTER-001",
-            role=Role.MASTER,
-            vessel_id=VESSEL_ID,
-        )
-        user_data = {
-            "id": "MASTER-001",
-            "name": "Capt. R. Menon",
-            "rank": "Master",
-            "rank_band": "officer",
-            "role": "master",
-            "language": "en",
-            "vessel": VESSEL_ID,
-            "checkin_reminder_at": "06:00",
-        }
-        return TokenResponse(
-            access_token=token,
-            token=token,
-            token_type="bearer",
-            expires_in=SESSION_EXPIRE_HOURS * 3600,
-            role=Role.MASTER,
-            vessel_id=VESSEL_ID,
-            crew_id="MASTER-001",
-            user=user_data,
-        )
+    # Ensure well-known shipboard hardware terminals exist in DeviceModel
+    if req.device_token == "master-console":
+        mc = db.query(DeviceModel).filter(DeviceModel.token == "master-console").first()
+        if not mc:
+            mc = DeviceModel(
+                id="dev-master-console",
+                token="master-console",
+                vessel_id=VESSEL_ID,
+                department="Bridge",
+                crew_id="MASTER-001",
+                crew_name="Capt. R. Menon",
+                hashed_pin=hash_pin_argon2("123456"),
+                failed_login_attempts=0,
+                preferred_language="en",
+                notifications_enabled=True,
+                created_at=get_utc_now(),
+                expires_at=get_utc_now() + timedelta(days=365),
+            )
+            db.add(mc)
+            db.commit()
+    elif req.device_token == "crew-tablet":
+        ct = db.query(DeviceModel).filter(DeviceModel.token == "crew-tablet").first()
+        if not ct:
+            ct = DeviceModel(
+                id="dev-crew-tablet",
+                token="crew-tablet",
+                vessel_id=VESSEL_ID,
+                department="Deck",
+                crew_id="u-crew",
+                crew_name="Arjun Nair",
+                hashed_pin=hash_pin_argon2("1234"),
+                failed_login_attempts=0,
+                preferred_language="en",
+                notifications_enabled=True,
+                created_at=get_utc_now(),
+                expires_at=get_utc_now() + timedelta(days=365),
+            )
+            db.add(ct)
+            db.commit()
 
     device = db.query(DeviceModel).filter(DeviceModel.token == req.device_token).first()
     if not device:
@@ -389,7 +426,21 @@ def login(
             }
         )
 
-    is_master = "MASTER" in device.department.upper() or "CAPTAIN" in device.crew_name.upper()
+    is_master = (
+        "MASTER" in device.department.upper()
+        or "CAPTAIN" in device.crew_name.upper()
+        or "CAPT" in device.crew_name.upper()
+        or "MASTER" in device.crew_id.upper()
+        or device.crew_id.upper() in ("U-MASTER", "MASTER", "MASTER-001")
+    )
+    if not is_master and device.crew_id:
+        acc = db.query(CrewAccountModel).filter(
+            (CrewAccountModel.id == device.crew_id) |
+            (func.lower(CrewAccountModel.username) == device.crew_id.lower())
+        ).first()
+        if acc and (acc.role == "master" or "master" in acc.rank.lower()):
+            is_master = True
+
     role = Role.MASTER if is_master else Role.CREW
     expected_pin_len = 6 if is_master else 4
 
@@ -434,7 +485,7 @@ def login(
         "id": device.crew_id,
         "name": device.crew_name,
         "rank": "Master" if is_master else "AB Seaman",
-        "rank_band": "officer" if is_master else "rating",
+        "rank_band": "Officer" if is_master else "Rating",
         "role": role.value if hasattr(role, "value") else str(role),
         "language": device.preferred_language or "en",
         "vessel": device.vessel_id,
@@ -511,7 +562,8 @@ def get_me(
     is_master = role == Role.MASTER or role == "master" or (account and account.role == "master")
     name = account.name if account else (device.crew_name if device else ("Capt. R. Menon" if is_master else "Arjun Nair"))
     rank = account.rank if account else ("Master" if is_master else ("AB Seaman" if not device else device.department))
-    rank_band = account.rank_band if account else ("officer" if is_master else "rating")
+    raw_rank_band = account.rank_band if account else ("officer" if is_master else "rating")
+    rank_band = "Officer" if is_master or (raw_rank_band or "").lower() == "officer" else "Rating"
     pref_lang = account.language if account else (device.preferred_language if device else "en")
 
     return {
@@ -561,7 +613,7 @@ def update_preferences(
         "crew_id": crew_id,
         "name": name,
         "rank": rank,
-        "rank_band": "officer" if is_master else "rating",
+        "rank_band": "Officer" if is_master else "Rating",
         "role": "master" if is_master else "crew",
         "language": new_lang or "en",
         "vessel": user.get("vessel_id", VESSEL_ID),
