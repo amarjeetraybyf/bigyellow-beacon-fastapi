@@ -310,11 +310,23 @@ async def structure_draft(
             draft["text"] = transcribed
             draft["transcript_original"] = transcribed
 
-    if not text:
-        if draft.get("photos"):
-            text = "Hazard observed on board from attached photo inspection."
+    if not text and draft.get("photos"):
+        # Photo-only draft: describe hazard with local vision model (gemma3:4b)
+        photo_bytes_list: List[bytes] = []
+        for p in draft["photos"]:
+            photo_path = UPLOADS_DIR / p.get("filename", "")
+            if photo_path.exists():
+                photo_bytes_list.append(photo_path.read_bytes())
+        vision_desc = await ai_gateway.describe_hazard_photos(photo_bytes_list)
+        if vision_desc:
+            text = vision_desc
+            draft["text"] = vision_desc
+            draft["transcript_original"] = vision_desc
         else:
-            text = "Seafarer observed equipment or environmental hazard during rounds."
+            text = "Hazard observed on board from attached photo inspection."
+
+    if not text:
+        text = "Seafarer observed equipment or environmental hazard during rounds."
 
     try:
         struct_res = await ai_gateway.structure_near_miss_report(draft_id, text, db=db)

@@ -23,7 +23,7 @@ from db_models import TicketModel, TicketMessageModel, PullCursorModel, ShoreUse
 from db import get_db
 from security import require_shore_role
 from services.audit_service import log_shore_action
-from services.gemini_service import generate_ticket_analysis
+from services.shore_ai_service import generate_ticket_analysis
 from services.similarity_service import find_similar_precedents
 
 router = APIRouter(prefix="/tickets", tags=["Shore Tickets"])

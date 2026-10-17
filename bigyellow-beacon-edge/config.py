@@ -35,5 +35,18 @@ SESSION_EXPIRE_HOURS = 12
 # Satellite Link Override: "auto", "up", "down"
 BEACON_LINK_OVERRIDE = os.getenv("BEACON_LINK_OVERRIDE", "auto")
 
+# Local Ollama AI Gateway (shipboard GPU inference)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_STRUCTURE_MODEL = os.getenv("OLLAMA_STRUCTURE_MODEL", "gemma3n:e4b")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3n:e2b")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "gemma3:4b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "embeddinggemma")
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
+
+# faster-whisper voice transcription (CUDA on VM GPU, CPU fallback)
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "medium")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+
 # Reverse Proxy / Gateway subpath prefix (e.g. "/edge" if hosted behind gateway)
 ROOT_PATH = os.getenv("ROOT_PATH", os.getenv("EDGE_ROOT_PATH", ""))

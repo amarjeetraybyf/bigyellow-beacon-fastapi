@@ -18,7 +18,7 @@ from contract.enums import Role, LearningStatus, PullChangeType
 from contract.uuid7 import uuid7_str
 from db_models import LearningModel, DailyAnchorCardModel, PullCursorModel, ShoreAuditLogModel
 from db import get_db
-from config import GEMINI_MODEL
+from services.shore_ai_service import generate_learning_draft, generate_anchor_week
 
 router = APIRouter(tags=["Shore Learnings & Daily Anchor Management"])
 
@@ -67,21 +67,24 @@ def create_shore_learning(req: LearningCreateRequest, db: Session = Depends(get_
 
 
 @router.post("/learnings/draft")
-def draft_learning_with_gemini(req: LearningDraftRequest, db: Session = Depends(get_db)):
+def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_db)):
     """
-    Draft concise 1-page maritime learning using Gemini AI.
+    Draft concise 1-page maritime learning using the shore AI backend
+    (local Ollama first, Vertex/Gemini cloud fallback).
     Never sends reporter_ref or personal crew identifiers.
     """
     draft_id = uuid7_str()
-    title = f"{req.topic or 'Hydraulic Line Pre-Operation Lockout Protocol'}"
-    summary = "Mandatory isolation of deck crane hydraulic manifolds prior to maintenance."
-    body = f"Based on precedent incidents involving pressurized fluid injection: {req.incident_context}\nKey Action: {req.key_safety_action}"
+    draft = generate_learning_draft(
+        topic=req.topic,
+        incident_context=req.incident_context or "Incident context and hazard conditions on board.",
+        key_safety_action=req.key_safety_action or "Review safety controls and procedure compliance.",
+    )
 
     learning = LearningModel(
         id=draft_id,
-        title=title,
-        summary=summary,
-        body=body,
+        title=draft["title"],
+        summary=draft["summary"],
+        body=draft["body"],
         status=LearningStatus.DRAFT.value,
         target_vessel_ids=[],
         origin="shore",
@@ -91,12 +94,12 @@ def draft_learning_with_gemini(req: LearningDraftRequest, db: Session = Depends(
 
     return {
         "id": draft_id,
-        "title": title,
-        "summary": summary,
-        "body": body,
-        "suggested_topics": ["Hydraulics", "Lockout/Tagout", "Deck Safety"],
-        "generated_by_model": GEMINI_MODEL,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "title": draft["title"],
+        "summary": draft["summary"],
+        "body": draft["body"],
+        "suggested_topics": draft.get("suggested_topics", []),
+        "generated_by_model": draft.get("model", "deterministic-fallback"),
+        "generated_at": draft.get("generated_at", datetime.now(timezone.utc).isoformat()),
     }
 
 
@@ -212,17 +215,11 @@ def list_anchor_cards(db: Session = Depends(get_db)):
 
 @router.post("/anchor/draft-week")
 def draft_anchor_week():
-    """Draft a week of micro-reflection cards using Gemini AI."""
-    topics = ["Situational Focus", "Line of Fire", "Fatigue Checking", "Clear Communication", "Hydraulic Awareness", "Weather Readiness", "Gratitude"]
-    drafts = []
-    for i, t in enumerate(topics):
-        drafts.append({
-            "topic": t,
-            "prompt": f"Daily Anchor for {t}: Pause before operating machinery. Verify isolating valves.",
-            "day_offset": i + 1,
-            "generated_by_model": GEMINI_MODEL,
-        })
-    return drafts
+    """
+    Draft a week of micro-reflection cards using the shore AI backend
+    (local Ollama first, Vertex/Gemini cloud fallback).
+    """
+    return generate_anchor_week()
 
 
 @router.post("/anchor/cards/{card_id}/approve")
