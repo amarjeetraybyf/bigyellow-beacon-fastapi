@@ -29,6 +29,7 @@ from security import generate_reporter_ref
 from services.pii_scrub import scrub_pii, strip_exif
 from services.sse_manager import sse_manager
 from services.ai_gateway import ai_gateway, SafetyRailTriggeredException
+from routes.auth_routes import resolve_crew_name
 
 router = APIRouter(prefix="/reports", tags=["Edge Ticket Reports"])
 
@@ -73,11 +74,14 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
     for item in raw_actions:
         if isinstance(item, dict):
             if "text" in item:
-                actions.append(item)
+                act = dict(item)
+                if act.get("photo_url"):
+                    act["photo_url"] = to_public_url(act["photo_url"])
+                actions.append(act)
             if "share_name_with_master" in item and not r_name:
                 s_name = item.get("share_name_with_master", False)
                 if s_name:
-                    r_name = item.get("reporter_name", "Arjun Nair")
+                    r_name = item.get("reporter_name") or resolve_crew_name(t.reporter_ref)
             if "audio_url" in item and item.get("audio_url"):
                 stored_audio_url = item.get("audio_url")
 
@@ -477,7 +481,7 @@ def finalize_report(
     scrubbed_action = scrub_pii(fields_dict.get("immediate_action", ""), roster_names=roster_names)
 
     now = get_utc_now()
-    reporter_name = user.get("name") or "Arjun Nair" if req.share_name_with_master else None
+    reporter_name = (user.get("name") or resolve_crew_name(user.get("crew_id"))) if req.share_name_with_master else None
 
     draft_photos = draft.get("photos", [])
     draft_audio = draft.get("audio")

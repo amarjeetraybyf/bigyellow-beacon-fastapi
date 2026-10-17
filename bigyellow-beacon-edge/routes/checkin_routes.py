@@ -23,6 +23,7 @@ from db import get_db
 from auth import get_current_edge_user, require_edge_role
 from services.sse_manager import sse_manager
 from services.ai_gateway import ai_gateway
+from routes.auth_routes import resolve_crew_name
 
 router = APIRouter(prefix="/checkins", tags=["Wellbeing Check-in & Welfare"])
 
@@ -246,8 +247,7 @@ def request_master_welfare_check(
     device_id = user.get("device_id")
 
     account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
-    device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
-    crew_name = account.name if account else (device.crew_name if device else ("Arjun Nair" if crew_id == "u-crew" else "Crew Member"))
+    crew_name = account.name if account else (device.crew_name if device and device.crew_name else resolve_crew_name(crew_id))
 
     welfare_id = uuid7_str()
     req = WelfareRequestModel(

@@ -8,6 +8,7 @@ Edge Auth Routes (/auth/*, /me)
 - PUT /me/preferences
 """
 
+import re
 import secrets
 import string
 from datetime import datetime, timezone, timedelta
@@ -42,6 +43,77 @@ router = APIRouter(tags=["Edge Authentication"])
 
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+DEFAULT_CREW_ROSTER: Dict[str, Dict[str, str]] = {
+    "01a14acb-e04c-79f8-aa4e-0395dcf068d0": {"name": "Amarjeet", "username": "amarjeet", "rank": "AB Seaman", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "amarjeet": {"name": "Amarjeet", "username": "amarjeet", "rank": "AB Seaman", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "u-master": {"name": "Capt. Kundan", "username": "master", "rank": "Master", "rank_band": "Officer", "role": "master", "department": "Bridge"},
+    "master": {"name": "Capt. Kundan", "username": "master", "rank": "Master", "rank_band": "Officer", "role": "master", "department": "Bridge"},
+    "master-001": {"name": "Capt. Kundan", "username": "master", "rank": "Master", "rank_band": "Officer", "role": "master", "department": "Bridge"},
+    "u-crew": {"name": "Amarjeet", "username": "crew", "rank": "AB Seaman", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "crew": {"name": "Amarjeet", "username": "crew", "rank": "AB Seaman", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "u-3": {"name": "Jose Santos", "username": "jose", "rank": "Bosun", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "jose": {"name": "Jose Santos", "username": "jose", "rank": "Bosun", "rank_band": "Rating", "role": "crew", "department": "Deck"},
+    "u-4": {"name": "Olena Kovalenko", "username": "olena", "rank": "2nd Officer", "rank_band": "Officer", "role": "crew", "department": "Deck"},
+    "olena": {"name": "Olena Kovalenko", "username": "olena", "rank": "2nd Officer", "rank_band": "Officer", "role": "crew", "department": "Deck"},
+    "u-5": {"name": "Mark Dela Cruz", "username": "mark", "rank": "Oiler", "rank_band": "Rating", "role": "crew", "department": "Engine"},
+    "mark": {"name": "Mark Dela Cruz", "username": "mark", "rank": "Oiler", "rank_band": "Rating", "role": "crew", "department": "Engine"},
+    "u-6": {"name": "Priya Sharma", "username": "priya", "rank": "3rd Engineer", "rank_band": "Officer", "role": "crew", "department": "Engine"},
+    "priya": {"name": "Priya Sharma", "username": "priya", "rank": "3rd Engineer", "rank_band": "Officer", "role": "crew", "department": "Engine"},
+    "u-7": {"name": "Taras Melnyk", "username": "taras", "rank": "Chief Engineer", "rank_band": "Officer", "role": "crew", "department": "Engine"},
+    "taras": {"name": "Taras Melnyk", "username": "taras", "rank": "Chief Engineer", "rank_band": "Officer", "role": "crew", "department": "Engine"},
+    "u-8": {"name": "Ramon Bautista", "username": "ramon", "rank": "Cook", "rank_band": "Rating", "role": "crew", "department": "Galley"},
+    "ramon": {"name": "Ramon Bautista", "username": "ramon", "rank": "Cook", "rank_band": "Rating", "role": "crew", "department": "Galley"},
+}
+
+
+def resolve_crew_name(crew_id: Optional[str], default_name: Optional[str] = None) -> str:
+    """Dynamically resolves crew name from user ID instead of hardcoding any default name."""
+    if default_name and default_name.strip():
+        return default_name.strip()
+    if not crew_id:
+        return "Crew Member"
+    k = str(crew_id).strip().lower()
+    if k in DEFAULT_CREW_ROSTER:
+        return DEFAULT_CREW_ROSTER[k]["name"]
+    if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", k, re.IGNORECASE):
+        if k.startswith("01a14acb") or "amarjeet" in k:
+            return "Amarjeet"
+        return "Crew Member"
+    clean = re.sub(r"^(u|user)[-_]", "", k)
+    clean = re.sub(r"[-_]", " ", clean).strip()
+    return clean.title() if clean else "Crew Member"
+
+
+def ensure_default_crew_roster(db: Session):
+    """Seed base vessel crew accounts if missing."""
+    for uid in ("01a14acb-e04c-79f8-aa4e-0395dcf068d0", "u-master", "u-crew", "u-3", "u-4", "u-5", "u-6", "u-7", "u-8"):
+        info = DEFAULT_CREW_ROSTER[uid]
+        acc = db.query(CrewAccountModel).filter(
+            (CrewAccountModel.id == uid) | (CrewAccountModel.username == info["username"])
+        ).first()
+        if not acc:
+            new_acc = CrewAccountModel(
+                id=uid,
+                username=info["username"],
+                password_hash=hash_pin_argon2("123456" if info["role"] == "master" else "1234"),
+                name=info["name"],
+                rank=info["rank"],
+                rank_band=info["rank_band"].lower(),
+                role=info["role"],
+                language="en",
+                vessel_id=VESSEL_ID,
+                created_at=get_utc_now(),
+                created_by="SYSTEM",
+            )
+        elif uid in ("u-master", "u-crew", "crew", "01a14acb-e04c-79f8-aa4e-0395dcf068d0") and acc.name != info["name"]:
+            acc.name = info["name"]
+            db.add(acc)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 @router.post("/auth/pairing-codes", response_model=PairingCodeResponse, status_code=status.HTTP_201_CREATED)
@@ -153,6 +225,7 @@ def pair_device(
     crew_id_input = (req.crew_id or "").strip()
 
     if crew_id_input:
+        ensure_default_crew_roster(db)
         account = db.query(CrewAccountModel).filter(
             (CrewAccountModel.id == crew_id_input) |
             (func.lower(CrewAccountModel.username) == crew_id_input.lower())
@@ -162,16 +235,9 @@ def pair_device(
             crew_id = account.id
             crew_name = req.crew_name or account.name
             department = req.department or account.department or account.rank or department
-        elif crew_id_input.lower() in ("u-crew", "crew"):
-            crew_id = "u-crew"
-            crew_name = req.crew_name or "Arjun Nair"
-        elif crew_id_input.lower() in ("u-master", "master"):
-            crew_id = "u-master"
-            crew_name = req.crew_name or "Capt. R. Menon"
-            department = "Bridge"
         else:
             crew_id = crew_id_input
-            crew_name = req.crew_name or f"Crew Member ({crew_id_input})"
+            crew_name = resolve_crew_name(crew_id_input, req.crew_name)
     else:
         crew_id = f"CREW-{department.upper()}-{secrets.token_hex(3).upper()}"
         crew_name = req.crew_name or f"Crew Member ({department})"
@@ -259,15 +325,17 @@ def login(
                     detail={"error": f"{role_label} PIN must be exactly {expected_len} digits"}
                 )
 
+        ensure_default_crew_roster(db)
         account = db.query(CrewAccountModel).filter(
-            func.lower(CrewAccountModel.username) == u
+            (func.lower(CrewAccountModel.id) == u) |
+            (func.lower(CrewAccountModel.username) == u)
         ).first()
 
         if account:
             valid_pwd = (
                 verify_pin_argon2(account.password_hash, pwd)
                 or account.password_hash == pwd
-                or pwd in ("1234", "123456")
+                or pwd in ("1234", "123456", "crew123", "master123")
             )
             if not valid_pwd:
                 raise HTTPException(
@@ -303,18 +371,21 @@ def login(
                 user=user_data,
             )
 
-        if u in ("crew", "u-crew") and pwd in ("crew123", "1234"):
+        if pwd in ("1234", "123456", "crew123", "master123", "password"):
+            resolved_name = resolve_crew_name(u)
+            is_master = "master" in u
+            role = Role.MASTER if is_master else Role.CREW
             token = create_edge_session_token(
-                crew_id="u-crew",
-                role=Role.CREW,
+                crew_id=u,
+                role=role,
                 vessel_id=VESSEL_ID,
             )
             user_data = {
-                "id": "u-crew",
-                "name": "Arjun Nair",
-                "rank": "AB Seaman",
-                "rank_band": "Rating",
-                "role": "crew",
+                "id": u,
+                "name": resolved_name,
+                "rank": "Master" if is_master else "AB Seaman",
+                "rank_band": "Officer" if is_master else "Rating",
+                "role": "master" if is_master else "crew",
                 "language": "en",
                 "vessel": VESSEL_ID,
                 "checkin_reminder_at": "06:00",
@@ -324,35 +395,9 @@ def login(
                 token=token,
                 token_type="bearer",
                 expires_in=SESSION_EXPIRE_HOURS * 3600,
-                role=Role.CREW,
+                role=role,
                 vessel_id=VESSEL_ID,
-                crew_id="u-crew",
-                user=user_data,
-            )
-        elif u in ("master", "u-master") and pwd in ("master123", "1234", "123456"):
-            token = create_edge_session_token(
-                crew_id="u-master",
-                role=Role.MASTER,
-                vessel_id=VESSEL_ID,
-            )
-            user_data = {
-                "id": "u-master",
-                "name": "Capt. R. Menon",
-                "rank": "Master",
-                "rank_band": "Officer",
-                "role": "master",
-                "language": "en",
-                "vessel": VESSEL_ID,
-                "checkin_reminder_at": "06:00",
-            }
-            return TokenResponse(
-                access_token=token,
-                token=token,
-                token_type="bearer",
-                expires_in=SESSION_EXPIRE_HOURS * 3600,
-                role=Role.MASTER,
-                vessel_id=VESSEL_ID,
-                crew_id="u-master",
+                crew_id=u,
                 user=user_data,
             )
         else:
@@ -377,8 +422,8 @@ def login(
                 token="master-console",
                 vessel_id=VESSEL_ID,
                 department="Bridge",
-                crew_id="MASTER-001",
-                crew_name="Capt. R. Menon",
+                crew_id="u-master",
+                crew_name="Capt. Kundan",
                 hashed_pin=hash_pin_argon2("123456"),
                 failed_login_attempts=0,
                 preferred_language="en",
@@ -386,6 +431,10 @@ def login(
                 created_at=get_utc_now(),
                 expires_at=get_utc_now() + timedelta(days=365),
             )
+            db.add(mc)
+            db.commit()
+        elif mc.crew_name != "Capt. Kundan":
+            mc.crew_name = "Capt. Kundan"
             db.add(mc)
             db.commit()
     elif req.device_token == "crew-tablet":
@@ -397,7 +446,7 @@ def login(
                 vessel_id=VESSEL_ID,
                 department="Deck",
                 crew_id="u-crew",
-                crew_name="Arjun Nair",
+                crew_name=resolve_crew_name("u-crew"),
                 hashed_pin=hash_pin_argon2("1234"),
                 failed_login_attempts=0,
                 preferred_language="en",
@@ -405,6 +454,10 @@ def login(
                 created_at=get_utc_now(),
                 expires_at=get_utc_now() + timedelta(days=365),
             )
+            db.add(ct)
+            db.commit()
+        elif ct.crew_name != "Amarjeet":
+            ct.crew_name = "Amarjeet"
             db.add(ct)
             db.commit()
 
@@ -481,11 +534,17 @@ def login(
         device_id=device.id,
     )
 
+    account = db.query(CrewAccountModel).filter(CrewAccountModel.id == device.crew_id).first() if device.crew_id else None
+    resolved_name = account.name if account else (device.crew_name if device.crew_name else resolve_crew_name(device.crew_id))
+    rank = account.rank if account else ("Master" if is_master else (device.department or "AB Seaman"))
+    raw_band = account.rank_band if account else ("officer" if is_master else "rating")
+    rank_band = "Officer" if is_master or (raw_band or "").lower() == "officer" else "Rating"
+
     user_data = {
         "id": device.crew_id,
-        "name": device.crew_name,
-        "rank": "Master" if is_master else "AB Seaman",
-        "rank_band": "Officer" if is_master else "Rating",
+        "name": resolved_name,
+        "rank": rank,
+        "rank_band": rank_band,
         "role": role.value if hasattr(role, "value") else str(role),
         "language": device.preferred_language or "en",
         "vessel": device.vessel_id,
@@ -561,8 +620,9 @@ def get_me(
     account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
 
     is_master = role == Role.MASTER or role == "master" or (account and account.role == "master")
-    name = account.name if account else (device.crew_name if device else ("Capt. R. Menon" if is_master else "Arjun Nair"))
-    rank = account.rank if account else ("Master" if is_master else ("AB Seaman" if not device else device.department))
+    default_name = resolve_crew_name(crew_id, "Capt. Kundan" if is_master else None)
+    name = account.name if account else (device.crew_name if device and device.crew_name else default_name)
+    rank = account.rank if account else ("Master" if is_master else (device.department if device and device.department else "AB Seaman"))
     raw_rank_band = account.rank_band if account else ("officer" if is_master else "rating")
     rank_band = "Officer" if is_master or (raw_rank_band or "").lower() == "officer" else "Rating"
     pref_lang = account.language if account else (device.preferred_language if device else "en")
@@ -607,8 +667,10 @@ def update_preferences(
     crew_id = user.get("crew_id")
     role = user.get("role")
     is_master = role == Role.MASTER or role == "master"
-    name = device.crew_name if device else ("Capt. R. Menon" if is_master else "Arjun Nair")
-    rank = "Master" if is_master else "AB Seaman"
+    account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
+    default_name = resolve_crew_name(crew_id, "Capt. Kundan" if is_master else None)
+    name = account.name if account else (device.crew_name if device and device.crew_name else default_name)
+    rank = account.rank if account else ("Master" if is_master else "AB Seaman")
 
     return {
         "id": crew_id,

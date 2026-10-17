@@ -4,6 +4,7 @@ against bigyellow-beacon-edge.
 """
 
 import asyncio
+import io
 from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
@@ -33,7 +34,7 @@ def test_crew_talk_auth_flow():
     assert "user" in data
     user = data["user"]
     assert user["role"] == "crew"
-    assert user["name"] == "Arjun Nair"
+    assert user["name"] == "Amarjeet"
     crew_token = data["token"]
 
     # 2. GET /me with token
@@ -55,7 +56,7 @@ def test_crew_talk_auth_flow():
     assert res_master.status_code == 200
     master_data = res_master.json()
     assert master_data["user"]["role"] == "master"
-    assert master_data["user"]["name"] == "Capt. R. Menon"
+    assert master_data["user"]["name"] == "Capt. Kundan"
 
 
 def test_crew_talk_checkins_flow():
@@ -309,6 +310,12 @@ def test_crew_talk_content_and_master():
 
 
 def test_master_creates_crew_and_crew_logins():
+    from db import get_db
+    from db_models import CrewAccountModel
+    db = next(get_db())
+    db.query(CrewAccountModel).filter(CrewAccountModel.username == "suresh").delete()
+    db.commit()
+
     # 1. Master logs in
     master_login = client.post("/auth/login", json={"username": "master", "password": "1234"})
     assert master_login.status_code == 200
@@ -434,7 +441,7 @@ def test_crew_talk_reports_audio_and_photos():
     assert len(ticket["photos"]) == 2
     assert ticket["audio_url"] is not None
     assert "uploads" in ticket["audio_url"]
-    assert ticket["reporter_name"] == "Arjun Nair"
+    assert ticket["reporter_name"] == "Amarjeet"
 
     ticket_id = ticket["id"]
 
@@ -481,7 +488,7 @@ def test_bulkhead_qr_pair_and_device_login():
     assert "device_token" in pair_data
     assert pair_data["device_token"].startswith("dev_")
     assert pair_data["crew_id"] == "u-crew"
-    assert pair_data["crew_name"] == "Arjun Nair"
+    assert pair_data["crew_name"] == "Amarjeet"
     device_token = pair_data["device_token"]
 
     # 2. Login with device_token + PIN 1234
@@ -495,7 +502,7 @@ def test_bulkhead_qr_pair_and_device_login():
     assert dev_login_res.status_code == 200
     session_data = dev_login_res.json()
     assert "token" in session_data
-    assert session_data["user"]["name"] == "Arjun Nair"
+    assert session_data["user"]["name"] == "Amarjeet"
 
     # 3. Pair new crew member with custom crew_id and bulkhead QR
     new_crew_res = client.post(
@@ -585,7 +592,7 @@ def test_api_v1_auth_login_spec():
             "pairing_code": "BEACON-QR-MV-PACIFIC-STAR",
             "crew_id": "u-master",
             "department": "Bridge",
-            "crew_name": "Capt. R. Menon",
+            "crew_name": "Capt. Kundan",
             "pin": "123456",
         },
     )
@@ -653,7 +660,7 @@ def test_api_v1_auth_login_spec():
     # Crew tablet success (4 digits)
     ct_ok = client.post("/api/v1/auth/login", json={"device_token": "crew-tablet", "pin": "1234"})
     assert ct_ok.status_code == 200
-    assert ct_ok.json()["user"]["name"] == "Arjun Nair"
+    assert ct_ok.json()["user"]["name"] == "Amarjeet"
     assert ct_ok.json()["user"]["rank_band"] == "Rating"
 
     # Crew tablet bad length (6 digits rejected)
@@ -664,7 +671,7 @@ def test_api_v1_auth_login_spec():
     # Master console success (6 digits)
     mc_ok = client.post("/api/v1/auth/login", json={"device_token": "master-console", "pin": "123456"})
     assert mc_ok.status_code == 200
-    assert mc_ok.json()["user"]["name"] == "Capt. R. Menon"
+    assert mc_ok.json()["user"]["name"] == "Capt. Kundan"
     assert mc_ok.json()["user"]["rank_band"] == "Officer"
 
     # Master console bad length (4 digits rejected)
@@ -703,7 +710,7 @@ def test_api_v1_me_and_session_role_switch():
     c_data = crew_me.json()
     assert c_data["id"] == "u-crew"
     assert c_data["crew_id"] == "u-crew"
-    assert c_data["name"] == "Arjun Nair"
+    assert c_data["name"] == "Amarjeet"
     assert c_data["role"] == "crew"
     assert c_data["rank_band"] == "Rating"
     assert c_data["vessel"] == "MV-PACIFIC-STAR"
@@ -728,7 +735,7 @@ def test_api_v1_me_and_session_role_switch():
     m_data = master_me.json()
     assert m_data["id"] in ("u-master", "MASTER-001")
     assert m_data["crew_id"] in ("u-master", "MASTER-001")
-    assert m_data["name"] == "Capt. R. Menon"
+    assert m_data["name"] == "Capt. Kundan"
     assert m_data["role"] == "master"
     assert m_data["rank_band"] == "Officer"
     assert m_data["vessel"] == "MV-PACIFIC-STAR"
@@ -827,5 +834,77 @@ def test_api_v1_reports_drafts_multipart_spec():
     assert no_text_res.status_code == 201
     assert no_text_res.json()["photos_count"] == 1
     assert no_text_res.json()["audio_attached"] is True
+
+
+def test_master_ticket_action_resolution_photo():
+    # 1. Login as crew member to file a report
+    crew_login = client.post("/auth/login", json={"username": "amarjeet", "pin": "1234"})
+    if crew_login.status_code != 200:
+        crew_login = client.post("/auth/login", json={"username": "crew1", "password": "1234"})
+    crew_token = crew_login.json()["token"]
+    crew_headers = {"Authorization": f"Bearer {crew_token}"}
+
+    # Create draft & submit report
+    draft_res = client.post("/reports/drafts", json={"text": "Loose handrail on poop deck"}, headers=crew_headers)
+    assert draft_res.status_code in (200, 201)
+    draft_id = draft_res.json()["draft_id"]
+
+    submit_res = client.post(
+        "/reports",
+        json={
+            "draft_id": draft_id,
+            "fields": {
+                "title_en": "Loose Handrail",
+                "description_en": "Loose handrail on poop deck near stairwell.",
+                "location_on_board": "Poop deck",
+                "hazard_type": "slip_trip_fall",
+                "ism_category": "unsafe_condition",
+                "severity": 2,
+                "immediate_action": "Marked with caution tape",
+            },
+        },
+        headers=crew_headers,
+    )
+    assert submit_res.status_code in (200, 201)
+    ticket_id = submit_res.json()["id"]
+
+    # 2. Login as master
+    master_login = client.post("/auth/login", json={"username": "master", "password": "1234"})
+    assert master_login.status_code == 200
+    master_token = master_login.json()["token"]
+    master_headers = {"Authorization": f"Bearer {master_token}"}
+
+    # 3. Post resolution action with photo upload (multipart/form-data)
+    fake_photo = io.BytesIO(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00")
+    action_res = client.post(
+        f"/master/tickets/{ticket_id}/actions",
+        data={
+            "text": "Handrail re-welded and secured with new bracket",
+            "responsible_rank": "Bosun",
+            "resolve": "true",
+        },
+        files={"photo": ("resolution_fix.jpg", fake_photo, "image/jpeg")},
+        headers=master_headers,
+    )
+    assert action_res.status_code == 200
+    data = action_res.json()
+    assert data["onboard_status"] == "RESOLVED_ON_BOARD"
+    assert len(data["actions"]) >= 1
+    last_action = data["actions"][-1]
+    assert last_action["resolved"] is True
+    assert last_action["text"] == "Handrail re-welded and secured with new bracket"
+    assert "photo_url" in last_action
+    assert last_action["photo_url"] is not None
+    assert "/uploads/resolution_" in last_action["photo_url"]
+    assert any("resolution_" in p for p in data["photos"])
+
+    # 4. Fetch ticket as crew member and verify resolution photo is passed back to user
+    crew_ticket_res = client.get(f"/tickets/{ticket_id}", headers=crew_headers)
+    assert crew_ticket_res.status_code == 200
+    crew_ticket = crew_ticket_res.json()
+    assert crew_ticket["onboard_status"] == "RESOLVED_ON_BOARD"
+    assert any(a.get("photo_url") == last_action["photo_url"] for a in crew_ticket["actions"])
+    assert any("resolution_" in p for p in crew_ticket["photos"])
+
 
 
