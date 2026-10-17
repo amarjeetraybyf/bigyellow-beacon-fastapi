@@ -2,21 +2,53 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "FastAPI: Run BigYellow Beacon",
+      "name": "FastAPI: Edge Server (Port 8000)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/main.py",
-      "cwd": "${workspaceFolder}",
+      "module": "uvicorn",
+      "args": [
+        "main:app",
+        "--reload",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+      ],
+      "cwd": "${workspaceFolder}/bigyellow-beacon-edge",
       "python": "${workspaceFolder}/.venv/bin/python",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}",
-        "PORT": "8000"
+        "PYTHONPATH": "${workspaceFolder}/bigyellow-beacon-edge",
+        "PORT": "8000",
+        "DEBUG": "true"
       },
       "console": "integratedTerminal",
       "justMyCode": true
     },
     {
-      "name": "FastAPI: Run with Uvicorn Module",
+      "name": "FastAPI: Shore Server (Port 8001)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "main:app",
+        "--reload",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001"
+      ],
+      "cwd": "${workspaceFolder}/bigyellow-beacon-shore",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/bigyellow-beacon-shore",
+        "PORT": "8001",
+        "DEBUG": "true"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "FastAPI: Monorepo Unified Gateway (Port 8000)",
       "type": "debugpy",
       "request": "launch",
       "module": "uvicorn",
@@ -31,10 +63,44 @@
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/bin/python",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}"
+        "PYTHONPATH": "${workspaceFolder}",
+        "PORT": "8000",
+        "DEBUG": "true"
       },
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "Pytest: Debug Edge Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests/",
+        "-v"
+      ],
+      "cwd": "${workspaceFolder}/bigyellow-beacon-edge",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/bigyellow-beacon-edge"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Pytest: Debug Shore Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests/",
+        "-v"
+      ],
+      "cwd": "${workspaceFolder}/bigyellow-beacon-shore",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/bigyellow-beacon-shore"
+      },
+      "console": "integratedTerminal"
     },
     {
       "name": "Python: Debug Current File",
@@ -47,22 +113,16 @@
         "PYTHONPATH": "${workspaceFolder}"
       },
       "console": "integratedTerminal"
-    },
+    }
+  ],
+  "compounds": [
     {
-      "name": "Pytest: Run All Tests",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "pytest",
-      "args": [
-        "tests/",
-        "-v"
+      "name": "Debug Both: Edge (8000) & Shore (8001)",
+      "configurations": [
+        "FastAPI: Edge Server (Port 8000)",
+        "FastAPI: Shore Server (Port 8001)"
       ],
-      "cwd": "${workspaceFolder}",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}"
-      },
-      "console": "integratedTerminal"
+      "stopAll": true
     }
   ]
 }

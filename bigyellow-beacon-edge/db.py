@@ -1,0 +1,44 @@
+"""
+Edge Database Engine and Session Dependency
+Supports PostgreSQL 16 and SQLite fallback for shipboard zero-maintenance resilience.
+"""
+
+from typing import Generator
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+from db_models import Base
+from config import DATABASE_URL
+
+
+def create_edge_engine(db_url: str):
+    connect_args = {}
+    if db_url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+    elif db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+    try:
+        eng = create_engine(db_url, connect_args=connect_args, echo=False)
+        with eng.connect() as conn:
+            pass
+        return eng
+    except Exception:
+        fallback_url = "sqlite:///edge_local.db"
+        return create_engine(fallback_url, connect_args={"check_same_thread": False}, echo=False)
+
+
+engine = create_edge_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def init_edge_db():
+    Base.metadata.create_all(bind=engine)
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

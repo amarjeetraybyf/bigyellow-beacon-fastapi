@@ -1,0 +1,100 @@
+"""
+BigYellow Beacon – Edge Server (FastAPI)
+Runs shipboard on mini-PC / Jetson LAN.
+Zero persistent internet dependency.
+"""
+
+from pathlib import Path
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from config import PORT, HOST, DEBUG, VESSEL_ID, ROOT_PATH
+from db import init_edge_db
+from middleware.idempotency import IdempotencyMiddleware
+from routes.auth_routes import router as auth_router
+from routes.reports_routes import router as reports_router
+from routes.master_routes import router as master_router
+from routes.ticket_messages_routes import router as ticket_messages_router
+from routes.inbox_routes import router as inbox_router
+from routes.events_routes import router as events_router
+from routes.checkin_routes import router as checkin_router
+from routes.learnings_routes import router as learnings_router
+from routes.sync_routes import router as sync_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_edge_db()
+    print("================================================================")
+    print(f"⚓ BigYellow Beacon Edge Server Running for Vessel: {VESSEL_ID}")
+    print(f"📡 Local Port: http://{HOST}:{PORT}")
+    print(f"📄 Swagger UI: http://{HOST}:{PORT}{ROOT_PATH}/docs")
+    print("================================================================")
+    yield
+
+
+app = FastAPI(
+    title=f"BigYellow Beacon Edge ({VESSEL_ID})",
+    version="2.0.0",
+    description="Shipboard edge safety intelligence server operating with 0 persistent internet.",
+    root_path=ROOT_PATH,
+    lifespan=lifespan,
+)
+
+
+# Exception handler returning uniform { "error": "...", ... }
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if isinstance(exc.detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
+
+
+# Idempotency Middleware for all edge writes
+app.add_middleware(IdempotencyMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount Static Files for Uploads and Media
+UPLOADS_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+app.mount("/media", StaticFiles(directory=str(UPLOADS_DIR)), name="media")
+
+# Mount Routes
+app.include_router(auth_router)
+app.include_router(reports_router)
+app.include_router(master_router)
+app.include_router(ticket_messages_router)
+app.include_router(inbox_router)
+app.include_router(events_router)
+app.include_router(checkin_router)
+app.include_router(learnings_router)
+app.include_router(sync_router)
+
+
+@app.get("/edge/docs", include_in_schema=False)
+@app.get("/edge", include_in_schema=False)
+def edge_docs_redirect():
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health", tags=["System"])
+@app.get("/healthz", tags=["System"])
+def edge_health():
+    return {
+        "status": "online",
+        "plane": "edge",
+        "vessel_id": VESSEL_ID,
+        "engine": "FastAPI + SQLite/Postgres (SQLAlchemy 2)",
+    }
