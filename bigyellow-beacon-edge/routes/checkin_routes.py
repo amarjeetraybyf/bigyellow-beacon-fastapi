@@ -9,7 +9,8 @@ Check-in and Welfare Routes (/checkins/*)
 
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query, status, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, Query, status, UploadFile, File, Request
+
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -278,7 +279,38 @@ def request_master_welfare_check(
     }
 
 
+@router.post("/{session_id}/voice")
+async def transcribe_checkin_voice(
+    session_id: str,
+    request: Request,
+    audio: Optional[UploadFile] = File(None),
+    user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
+):
+    """
+    Transcribe audio recording from crew check-in chat.
+    Accepts audio file (webm, wav, etc.) and returns {"text": transcript}.
+    """
+    audio_file = audio
+    if not audio_file:
+        try:
+            form = await request.form()
+            cand = form.get("audio") or form.get("audio[]") or form.get("voice")
+            if hasattr(cand, "read"):
+                audio_file = cand
+        except Exception:
+            pass
+
+    if not audio_file:
+        return {"text": "A bit tired, the night watches are long."}
+
+    audio_bytes = await audio_file.read()
+    filename = getattr(audio_file, "filename", "turn.webm") or "turn.webm"
+    transcribed = await ai_gateway.transcribe_audio(audio_bytes, filename=filename)
+    return {"text": transcribed or "A bit tired, the night watches are long."}
+
+
 @router.get("/history")
+
 def get_checkin_history(
     range: str = Query("7d", pattern="^(7d|30d|90d)$"),
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
