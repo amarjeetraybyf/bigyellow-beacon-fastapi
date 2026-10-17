@@ -219,16 +219,21 @@ class PairingCodeResponse(BaseModel):
 
 class PairRequest(BaseModel):
     pairing_code: str
-    department: Optional[str] = "Deck"
     crew_id: Optional[str] = None
+    department: Optional[str] = "Deck"
     crew_name: Optional[str] = None
+    pin: Optional[str] = "1234"
 
 
 class PairResponse(BaseModel):
     device_token: str
+    device_id: Optional[str] = None
     vessel_id: str
-    department: str
+    crew_id: Optional[str] = None
+    crew_name: Optional[str] = None
+    department: Optional[str] = "Deck"
     expires_at: datetime
+    token: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
