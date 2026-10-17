@@ -750,3 +750,82 @@ def test_api_v1_me_and_session_role_switch():
     assert switched_crew_me.json()["role"] == "crew"
     assert switched_crew_me.json()["rank_band"] == "Rating"
 
+
+def test_api_v1_reports_drafts_multipart_spec():
+    """
+    Contract test for POST /api/v1/reports/drafts:
+    1. Valid multipart upload: voice audio (<= 60s), up to 3 photos (EXIF stripped), optional text -> 201.
+    2. Voice audio > 60s rejected with 422 Unprocessable Entity.
+    3. More than 3 photos rejected with 422 Unprocessable Entity.
+    4. Optional text (voice and photo only) -> 201.
+    """
+    # 1. Login as crew
+    login_res = client.post("/api/v1/auth/login", json={"device_token": "crew-tablet", "pin": "1234"})
+    assert login_res.status_code == 200
+    token = login_res.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    fake_audio = ("voice.webm", b"\x1a\x45\xdf\xa3fake-voice-bytes", "audio/webm")
+    fake_photo_1 = ("photo1.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIFfakephoto1", "image/jpeg")
+    fake_photo_2 = ("photo2.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIFfakephoto2", "image/jpeg")
+    fake_photo_3 = ("photo3.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIFfakephoto3", "image/jpeg")
+    fake_photo_4 = ("photo4.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIFfakephoto4", "image/jpeg")
+
+    # 1. Valid: voice audio (45s <= 60s), 3 photos, optional text
+    valid_res = client.post(
+        "/api/v1/reports/drafts",
+        data={"text": "Hydraulic oil leak observed near deck crane 2", "duration": "45.0", "lang": "en"},
+        files=[
+            ("audio", fake_audio),
+            ("photos[]", fake_photo_1),
+            ("photos[]", fake_photo_2),
+            ("photos[]", fake_photo_3),
+        ],
+        headers=headers,
+    )
+    assert valid_res.status_code == 201
+    valid_data = valid_res.json()
+    assert "draft_id" in valid_data
+    assert valid_data["photos_count"] == 3
+    assert valid_data["audio_attached"] is True
+
+    # 2. Voice audio > 60s rejected with 422
+    over_duration_res = client.post(
+        "/api/v1/reports/drafts",
+        data={"text": "Long recording", "duration": "65.5"},
+        files=[("audio", fake_audio)],
+        headers=headers,
+    )
+    assert over_duration_res.status_code == 422
+    assert "60 seconds" in over_duration_res.json()["error"]
+
+    # 3. More than 3 photos rejected with 422
+    over_photos_res = client.post(
+        "/api/v1/reports/drafts",
+        data={"text": "Four photos"},
+        files=[
+            ("photos[]", fake_photo_1),
+            ("photos[]", fake_photo_2),
+            ("photos[]", fake_photo_3),
+            ("photos[]", fake_photo_4),
+        ],
+        headers=headers,
+    )
+    assert over_photos_res.status_code == 422
+    assert "Maximum 3 photos" in over_photos_res.json()["error"]
+
+    # 4. Voice audio + photos without text (optional text)
+    no_text_res = client.post(
+        "/api/v1/reports/drafts",
+        data={"duration": "30.0"},
+        files=[
+            ("audio", fake_audio),
+            ("photos[]", fake_photo_1),
+        ],
+        headers=headers,
+    )
+    assert no_text_res.status_code == 201
+    assert no_text_res.json()["photos_count"] == 1
+    assert no_text_res.json()["audio_attached"] is True
+
+

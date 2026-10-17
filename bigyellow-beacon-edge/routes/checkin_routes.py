@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from contract.enums import Role, SSEEvent
 from contract.uuid7 import uuid7_str
 from contract.models import CheckInCreate, CheckInTurnRequest
-from db_models import CheckinModel, WelfareRequestModel, DeviceModel
+from db_models import CheckinModel, WelfareRequestModel, DeviceModel, CrewAccountModel
 from config import VESSEL_ID
 from db import get_db
 from auth import get_current_edge_user, require_edge_role
@@ -245,8 +245,9 @@ def request_master_welfare_check(
     vessel_id = user.get("vessel_id", VESSEL_ID)
     device_id = user.get("device_id")
 
+    account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
     device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
-    crew_name = device.crew_name if device else ("Arjun Nair" if crew_id == "u-crew" else "Crew Member")
+    crew_name = account.name if account else (device.crew_name if device else ("Arjun Nair" if crew_id == "u-crew" else "Crew Member"))
 
     welfare_id = uuid7_str()
     req = WelfareRequestModel(
