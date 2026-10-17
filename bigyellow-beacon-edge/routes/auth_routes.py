@@ -547,6 +547,7 @@ def revoke_master_device(
 
 
 @router.get("/me")
+@router.get("/api/v1/me")
 def get_me(
     user: Dict[str, Any] = Depends(get_current_edge_user),
     db: Session = Depends(get_db),
@@ -587,6 +588,7 @@ def get_me(
 
 
 @router.put("/me/preferences")
+@router.put("/api/v1/me/preferences")
 def update_preferences(
     prefs: PreferencesUpdateRequest,
     user: Dict[str, Any] = Depends(get_current_edge_user),

@@ -671,3 +671,82 @@ def test_api_v1_auth_login_spec():
     mc_bad = client.post("/api/v1/auth/login", json={"device_token": "master-console", "pin": "1234"})
     assert mc_bad.status_code == 400
     assert "6 digits" in mc_bad.json()["error"]
+
+
+def test_api_v1_me_and_session_role_switch():
+    """
+    Contract test for GET /api/v1/me and Crew & Master session / role switching.
+    1. Verify unauthenticated GET /api/v1/me fails with 401.
+    2. Crew PIN Pad login (4-digit PIN 1234) -> GET /api/v1/me returns crew profile & rank_band: Rating.
+    3. Terminal role switch to Master (6-digit PIN 123456) -> GET /api/v1/me returns master profile & rank_band: Officer.
+    4. Terminal role switch back to Crew -> GET /api/v1/me validates crew session.
+    """
+    # 1. Unauthenticated GET /api/v1/me returns 401
+    unauth = client.get("/api/v1/me")
+    assert unauth.status_code == 401
+
+    # 2. Crew PIN Pad Login (4 digits)
+    crew_login = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": "crew-tablet", "pin": "1234"},
+    )
+    assert crew_login.status_code == 200
+    crew_token = crew_login.json()["token"]
+    assert crew_token
+
+    # Verify GET /api/v1/me with Crew session
+    crew_me = client.get(
+        "/api/v1/me",
+        headers={"Authorization": f"Bearer {crew_token}"},
+    )
+    assert crew_me.status_code == 200
+    c_data = crew_me.json()
+    assert c_data["id"] == "u-crew"
+    assert c_data["crew_id"] == "u-crew"
+    assert c_data["name"] == "Arjun Nair"
+    assert c_data["role"] == "crew"
+    assert c_data["rank_band"] == "Rating"
+    assert c_data["vessel"] == "MV-PACIFIC-STAR"
+    assert "preferences" in c_data
+    assert c_data["preferences"]["preferred_language"] in ("en", "hi", "tl")
+
+    # 3. Session / Role switch to Master (6 digits) without clearing browser/terminal
+    master_switch = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": "master-console", "pin": "123456"},
+    )
+    assert master_switch.status_code == 200
+    master_token = master_switch.json()["token"]
+    assert master_token
+
+    # Verify GET /api/v1/me with Master session
+    master_me = client.get(
+        "/api/v1/me",
+        headers={"Authorization": f"Bearer {master_token}"},
+    )
+    assert master_me.status_code == 200
+    m_data = master_me.json()
+    assert m_data["id"] in ("u-master", "MASTER-001")
+    assert m_data["crew_id"] in ("u-master", "MASTER-001")
+    assert m_data["name"] == "Capt. R. Menon"
+    assert m_data["role"] == "master"
+    assert m_data["rank_band"] == "Officer"
+    assert m_data["vessel"] == "MV-PACIFIC-STAR"
+    assert "preferences" in m_data
+
+    # 4. Switch back to Crew watch
+    crew_switch = client.post(
+        "/api/v1/auth/login",
+        json={"device_token": "crew-tablet", "pin": "1234"},
+    )
+    assert crew_switch.status_code == 200
+    switched_crew_token = crew_switch.json()["token"]
+
+    switched_crew_me = client.get(
+        "/api/v1/me",
+        headers={"Authorization": f"Bearer {switched_crew_token}"},
+    )
+    assert switched_crew_me.status_code == 200
+    assert switched_crew_me.json()["role"] == "crew"
+    assert switched_crew_me.json()["rank_band"] == "Rating"
+
