@@ -102,9 +102,16 @@ def get_current_shore_user(
     return user
 
 
-def require_shore_role(allowed_roles: list[Role]):
+def require_shore_role(*allowed_roles):
+    roles = []
+    for r in allowed_roles:
+        if isinstance(r, (list, tuple, set)):
+            roles.extend(r)
+        else:
+            roles.append(r)
+    allowed_str = [r.value if hasattr(r, "value") else str(r) for r in roles]
+
     def role_checker(user: ShoreUserModel = Depends(get_current_shore_user)) -> ShoreUserModel:
-        allowed_str = [r.value for r in allowed_roles]
         if user.role not in allowed_str:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

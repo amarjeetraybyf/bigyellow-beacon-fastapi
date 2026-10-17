@@ -96,9 +96,19 @@ class Learning(SyncedBaseModel):
     title: str
     summary: str
     body: str
+    context: Optional[str] = None
+    situation: Optional[str] = None
+    do_points: List[str] = Field(default_factory=list)
+    dont_points: List[str] = Field(default_factory=list)
+    check_question: Optional[Dict[str, Any]] = None
+    audience: Optional[Dict[str, Any]] = None
+    priority: str = "normal"
     status: LearningStatus = LearningStatus.DRAFT
     media: List[Dict[str, Any]] = Field(default_factory=list)
     target_vessel_ids: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    stats: Optional[Dict[str, Any]] = None
+    published_at: Optional[str] = None
 
 
 # ─── DAILY ANCHOR ────────────────────────────────────────────────────────────
@@ -108,6 +118,23 @@ class DailyAnchorCard(SyncedBaseModel):
     quote_or_prompt: str
     translations: Dict[str, str] = Field(default_factory=dict)
     scheduled_date: str  # YYYY-MM-DD
+
+
+class AnchorCard(SyncedBaseModel):
+    publish_date: str
+    scheduled_date: Optional[str] = None
+    type: str = "safety"
+    title: str
+    topic: Optional[str] = None
+    body: str
+    quote_or_prompt: Optional[str] = None
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    audience: str = "all"
+    status: str = "draft"
+    translations: Dict[str, str] = Field(default_factory=dict)
+    stats: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ─── CHECKINS & WELFARE ──────────────────────────────────────────────────────
@@ -187,11 +214,13 @@ class PairingCodeResponse(BaseModel):
     code: str
     vessel_id: str
     expires_at: datetime
+    qr_payload: Optional[str] = None
 
 
 class PairRequest(BaseModel):
     pairing_code: str
-    department: str
+    department: Optional[str] = "Deck"
+    crew_id: Optional[str] = None
     crew_name: Optional[str] = None
 
 

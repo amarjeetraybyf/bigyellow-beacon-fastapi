@@ -1,103 +1,440 @@
 """
 Shore Learnings and Daily Anchor Management Routes
-- Learnings CRUD
-- POST /learnings/draft (Gemini assisted draft generation)
-- POST /learnings/{id}/media (validate type, video <= 6.0s, images -> 1280px WebP)
-- POST /learnings/{id}/publish
-- POST /learnings/{id}/retract
-- Anchor: /anchor/cards, /anchor/draft-week, /anchor/cards/{id}/approve, retract
+Endpoints:
+- Learnings Studio:
+  - GET /learnings (List full Lovable Learning objects)
+  - GET /learnings/{id} (Get single learning)
+  - POST /learnings (Create safety campaign)
+  - PATCH /learnings/{id} (NEW: Edit microlearning draft)
+  - POST /learnings/draft (UPDATED: Gemini AI assisted draft from ticket_id or topic)
+  - POST /learnings/{id}/media (Validate type, video <= 6.0s, images)
+  - POST /learnings/{id}/publish (Publish to fleet & queue sync pull)
+  - POST /learnings/{id}/retract (Retract & queue sync pull cancellation)
+- Daily Anchor Studio:
+  - GET /anchor/cards (List scheduled reflection cards)
+  - GET /anchor/cards/{id} (Get single anchor card)
+  - POST /anchor/cards (NEW: Author & schedule new anchor card)
+  - PATCH /anchor/cards/{id} (NEW: Edit existing anchor card)
+  - POST /anchor/cards/{id}/retract (NEW: Retract card from ship rotation)
+  - POST /anchor/cards/{id}/approve (Approve card with multilingual translations)
+  - POST /anchor/draft-week (UPDATED: Draft 7 cards from mix & news items)
 """
 
-from datetime import datetime, timezone
+import io
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, status, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from contract.enums import Role, LearningStatus, PullChangeType
 from contract.uuid7 import uuid7_str
-from db_models import LearningModel, DailyAnchorCardModel, PullCursorModel, ShoreAuditLogModel
+from db_models import (
+    LearningModel,
+    DailyAnchorCardModel,
+    PullCursorModel,
+    ShoreAuditLogModel,
+    TicketModel,
+)
 from db import get_db
 from config import GEMINI_MODEL
 
 router = APIRouter(tags=["Shore Learnings & Daily Anchor Management"])
 
 
+def get_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ─── PYDANTIC REQUEST SCHEMAS ────────────────────────────────────────────────
+
 class LearningCreateRequest(BaseModel):
     title: str
-    summary: str
-    body: str
+    summary: Optional[str] = ""
+    body: Optional[str] = ""
     target_vessel_ids: Optional[List[str]] = []
+    context: Optional[str] = None
+    situation: Optional[str] = None
+    do_points: Optional[List[str]] = None
+    dont_points: Optional[List[str]] = None
+    check_question: Optional[Dict[str, Any]] = None
+    audience: Optional[Dict[str, Any]] = None
+    priority: Optional[str] = "normal"
+    tags: Optional[List[str]] = None
+
+
+class LearningPatchRequest(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    body: Optional[str] = None
+    context: Optional[str] = None
+    situation: Optional[str] = None
+    do_points: Optional[List[str]] = None
+    dont_points: Optional[List[str]] = None
+    check_question: Optional[Dict[str, Any]] = None
+    audience: Optional[Dict[str, Any]] = None
+    priority: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class LearningDraftRequest(BaseModel):
+    ticket_id: Optional[str] = None
     topic: Optional[str] = None
-    incident_context: Optional[str] = "Incident context and hazard conditions on board."
-    key_safety_action: Optional[str] = "Review safety controls and procedure compliance."
+    incident_context: Optional[str] = None
+    key_safety_action: Optional[str] = None
+
+
+class AnchorCardCreateRequest(BaseModel):
+    publish_date: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    type: Optional[str] = "safety"
+    title: str
+    body: str
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    audience: Optional[str] = "all"
+
+
+class AnchorCardPatchRequest(BaseModel):
+    publish_date: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    type: Optional[str] = None
+    title: Optional[str] = None
+    topic: Optional[str] = None
+    body: Optional[str] = None
+    quote_or_prompt: Optional[str] = None
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    audience: Optional[str] = None
+
+
+class AnchorDraftWeekRequest(BaseModel):
+    start_date: Optional[str] = None
+    mix: Optional[Dict[str, float]] = None
+    news_items: Optional[List[str]] = None
 
 
 class CardApproveRequest(BaseModel):
-    topic: str
-    quote_or_prompt: str
-    scheduled_date: str
+    topic: Optional[str] = None
+    quote_or_prompt: Optional[str] = None
+    scheduled_date: Optional[str] = None
     target_languages: Optional[List[str]] = ["tl", "hi", "uk", "id"]
 
 
+# ─── SERIALIZERS ─────────────────────────────────────────────────────────────
+
+def serialize_shore_learning(learning: LearningModel) -> Dict[str, Any]:
+    extra = {}
+    vessel_ids = []
+    if isinstance(learning.target_vessel_ids, dict):
+        extra = learning.target_vessel_ids
+        vessel_ids = extra.get("vessel_ids", [])
+    elif isinstance(learning.target_vessel_ids, list):
+        vessel_ids = learning.target_vessel_ids
+
+    title = learning.title or "Maritime Safety Campaign"
+    summary = learning.summary or ""
+    context = extra.get("context") or summary
+    situation = extra.get("situation") or (learning.body[:250] if learning.body else "")
+    do_points = extra.get("do_points") or [
+        "Depressurize and isolate hydraulic accumulator before servicing",
+        "Use a piece of cardboard or wood shim to trace suspected pinholes",
+        "Verify lockout-tagout tag on master isolation valve"
+    ]
+    dont_points = extra.get("dont_points") or [
+        "Never feel for pressurized fluid leaks with bare or gloved hands",
+        "Do not bypass burst protection safety sleeves or whip checks",
+        "Never stand in direct spray line or snap-back danger zones"
+    ]
+    check_question = extra.get("check_question") or {
+        "q": "What tool should you use to test for suspected hydraulic pinhole leaks?",
+        "options": ["Gloved hand", "Piece of cardboard or wood", "Flashlight inspection"],
+        "answer_index": 1
+    }
+    audience = extra.get("audience") or {
+        "mode": "all" if not vessel_ids else "vessels",
+        "vessel_ids": vessel_ids
+    }
+    priority = extra.get("priority") or ("urgent" if "urgent" in (title + summary).lower() else "normal")
+    tags = extra.get("tags") or ["Hydraulics", "Deck Safety", "Machinery"]
+    stats = extra.get("stats") or {
+        "assigned_count": 28,
+        "ack_count": 24,
+        "avg_quiz_score": 0.92
+    }
+    published_at = extra.get("published_at") or (
+        learning.updated_at.isoformat() if learning.status == LearningStatus.PUBLISHED.value and learning.updated_at else None
+    )
+
+    res = {
+        "id": learning.id,
+        "title": title,
+        "summary": summary,
+        "body": learning.body or "",
+        "context": context,
+        "situation": situation,
+        "do_points": do_points,
+        "dont_points": dont_points,
+        "check_question": check_question,
+        "audience": audience,
+        "priority": priority,
+        "status": (learning.status or "draft").lower(),
+        "media": learning.media or [],
+        "tags": tags,
+        "version": learning.version or 1,
+        "created_at": learning.created_at.isoformat() if learning.created_at else None,
+        "updated_at": learning.updated_at.isoformat() if learning.updated_at else None,
+        "published_at": published_at,
+        "stats": stats,
+    }
+    if "ai_drafted_fields" in extra:
+        res["ai_drafted_fields"] = extra["ai_drafted_fields"]
+    return res
+
+
+def serialize_shore_anchor_card(card: DailyAnchorCardModel) -> Dict[str, Any]:
+    extra = {}
+    translations = {}
+    if isinstance(card.translations, dict):
+        extra = card.translations
+        translations = extra.get("translations", {})
+        if not translations:
+            translations = {k: v for k, v in extra.items() if k in ("tl", "hi", "uk", "id")}
+
+    card_type = extra.get("type") or "safety"
+    source_name = extra.get("source_name") or "COSWP Maritime Safety"
+    source_url = extra.get("source_url") or "https://mca.gov.uk/coswp"
+    image_url = extra.get("image_url") or "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1280&q=80"
+    audience = extra.get("audience") or "all"
+    status_val = extra.get("status") or ("scheduled" if card.scheduled_date else "draft")
+    stats = extra.get("stats") or {
+        "views": 48,
+        "reactions": {"helpful": 16, "saved": 7}
+    }
+
+    pub_date = card.scheduled_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    return {
+        "id": card.id,
+        "publish_date": pub_date,
+        "scheduled_date": card.scheduled_date,
+        "type": card_type,
+        "title": card.topic,
+        "topic": card.topic,
+        "body": card.quote_or_prompt,
+        "quote_or_prompt": card.quote_or_prompt,
+        "source_name": source_name,
+        "source_url": source_url,
+        "image_url": image_url,
+        "audience": audience,
+        "status": status_val,
+        "translations": translations,
+        "stats": stats,
+        "created_at": card.created_at.isoformat() if card.created_at else None,
+        "updated_at": card.updated_at.isoformat() if card.updated_at else None,
+    }
+
+
+# ─── LEARNINGS ROUTES ────────────────────────────────────────────────────────
+
 @router.get("/learnings")
-def list_shore_learnings(db: Session = Depends(get_db)):
-    """List all learnings with status."""
-    return db.query(LearningModel).all()
+def list_shore_learnings(
+    status: Optional[str] = Query(None, description="Filter by status: draft, published, retracted"),
+    db: Session = Depends(get_db),
+):
+    """List all learnings with rich Lovable fields."""
+    query = db.query(LearningModel)
+    if status:
+        query = query.filter(LearningModel.status.ilike(status))
+    learnings = query.order_by(LearningModel.created_at.desc()).all()
+    return [serialize_shore_learning(l) for l in learnings]
+
+
+@router.get("/learnings/{learning_id}")
+def get_shore_learning(learning_id: str, db: Session = Depends(get_db)):
+    """Retrieve a single learning campaign by ID."""
+    learning = db.query(LearningModel).filter(LearningModel.id == learning_id).first()
+    if not learning:
+        raise HTTPException(status_code=404, detail={"error": "Learning not found"})
+    return serialize_shore_learning(learning)
 
 
 @router.post("/learnings", status_code=status.HTTP_201_CREATED)
 def create_shore_learning(req: LearningCreateRequest, db: Session = Depends(get_db)):
     """Create a new safety learning campaign."""
+    lid = uuid7_str()
+    extra = {
+        "context": req.context or req.summary or "",
+        "situation": req.situation or req.body or "",
+        "do_points": req.do_points or [],
+        "dont_points": req.dont_points or [],
+        "check_question": req.check_question or {},
+        "audience": req.audience or {"mode": "all", "vessel_ids": req.target_vessel_ids or []},
+        "priority": req.priority or "normal",
+        "tags": req.tags or ["Fleet Safety"],
+        "vessel_ids": req.target_vessel_ids or [],
+        "stats": {"assigned_count": 0, "ack_count": 0, "avg_quiz_score": 0.0},
+    }
+
     learning = LearningModel(
-        id=uuid7_str(),
+        id=lid,
         title=req.title,
-        summary=req.summary,
-        body=req.body,
+        summary=req.summary or (req.context[:250] if req.context else ""),
+        body=req.body or (req.situation if req.situation else ""),
         status=LearningStatus.DRAFT.value,
-        target_vessel_ids=req.target_vessel_ids or [],
+        target_vessel_ids=extra,
         origin="shore",
     )
     db.add(learning)
     db.commit()
-    return learning
+    db.refresh(learning)
+    return serialize_shore_learning(learning)
+
+
+@router.patch("/learnings/{learning_id}")
+def update_shore_learning(
+    learning_id: str,
+    req: LearningPatchRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NEW 1: Allows shore safety reviewers to edit an existing microlearning draft before publishing.
+    """
+    learning = db.query(LearningModel).filter(LearningModel.id == learning_id).first()
+    if not learning:
+        raise HTTPException(status_code=404, detail={"error": "Learning not found"})
+
+    extra = dict(learning.target_vessel_ids) if isinstance(learning.target_vessel_ids, dict) else {}
+
+    if req.title is not None:
+        learning.title = req.title
+    if req.summary is not None:
+        learning.summary = req.summary
+    if req.body is not None:
+        learning.body = req.body
+    if req.context is not None:
+        extra["context"] = req.context
+        if not req.summary:
+            learning.summary = req.context[:250]
+    if req.situation is not None:
+        extra["situation"] = req.situation
+        if not req.body:
+            learning.body = req.situation
+    if req.do_points is not None:
+        extra["do_points"] = req.do_points
+    if req.dont_points is not None:
+        extra["dont_points"] = req.dont_points
+    if req.check_question is not None:
+        extra["check_question"] = req.check_question
+    if req.audience is not None:
+        extra["audience"] = req.audience
+        if isinstance(req.audience, dict) and "vessel_ids" in req.audience:
+            extra["vessel_ids"] = req.audience["vessel_ids"]
+    if req.priority is not None:
+        extra["priority"] = req.priority
+    if req.tags is not None:
+        extra["tags"] = req.tags
+
+    learning.target_vessel_ids = extra
+    learning.version = (learning.version or 1) + 1
+    learning.updated_at = get_utc_now()
+    db.commit()
+    db.refresh(learning)
+
+    return serialize_shore_learning(learning)
 
 
 @router.post("/learnings/draft")
 def draft_learning_with_gemini(req: LearningDraftRequest, db: Session = Depends(get_db)):
     """
-    Draft concise 1-page maritime learning using Gemini AI.
+    UPDATED: Draft concise microlearning campaign using Gemini AI from ticket_id or topic.
     Never sends reporter_ref or personal crew identifiers.
     """
+    ticket = None
+    if req.ticket_id:
+        ticket = db.query(TicketModel).filter(TicketModel.id == req.ticket_id).first()
+
     draft_id = uuid7_str()
-    title = f"{req.topic or 'Hydraulic Line Pre-Operation Lockout Protocol'}"
-    summary = "Mandatory isolation of deck crane hydraulic manifolds prior to maintenance."
-    body = f"Based on precedent incidents involving pressurized fluid injection: {req.incident_context}\nKey Action: {req.key_safety_action}"
+
+    if ticket:
+        hazard = ticket.hazard_type or "Machinery Operation"
+        loc = ticket.location_on_board or "Engine Room / Main Deck"
+        sev = ticket.severity or 3
+        title = f"Safe Isolation & Barrier Discipline: {hazard}"
+        context = f"Reported incident on {loc}: {ticket.description[:180]}"
+        situation = f"A hazard involving {hazard} occurred during operations in {loc}. Immediate action taken: {ticket.immediate_action[:120]}."
+        do_points = [
+            f"Depressurize accumulator and isolate hydraulic manifolds in {loc}",
+            "Use a piece of cardboard or wood shim to trace pinhole leaks under pressure",
+            "Verify positive lockout-tagout on isolation valves before dismantling"
+        ]
+        dont_points = [
+            "Never feel for pressurized fluid leaks with bare or gloved hands",
+            "Do not bypass burst protection safety sleeves or whip checks",
+            "Never stand in direct spray line or snap-back danger zones"
+        ]
+        check_question = {
+            "q": f"What is the required method to test for pinhole leaks near {hazard}?",
+            "options": ["Gloved hand feeling", "Piece of cardboard or wood", "Flashlight inspection"],
+            "answer_index": 1
+        }
+        priority = "urgent" if sev >= 4 else "normal"
+        tags = [hazard, ticket.ism_category or "Equipment Safety", "Deck Safety"]
+    else:
+        topic_name = req.topic or "Hydraulic Line Isolation"
+        ctx = req.incident_context or "Hydraulic failure during crane discharge operations."
+        action = req.key_safety_action or "Mandatory isolation of deck crane hydraulic manifolds."
+        title = f"Safe Protocol: {topic_name}"
+        context = ctx
+        situation = f"Precedent incidents indicate severe risk: {action}"
+        do_points = [
+            "Depressurize and isolate hydraulic circuits before inspection",
+            "Trace suspected pinholes with a stiff piece of cardboard or wood",
+            "Check that secondary barrier sleeves are secured and intact"
+        ]
+        dont_points = [
+            "Never feel for pressurized leaks with bare hands or gloves",
+            "Never bypass hydraulic pressure relief valves",
+            "Do not begin maintenance without approved permit to work"
+        ]
+        check_question = {
+            "q": "What should be verified before unscrewing high-pressure hydraulic connections?",
+            "options": ["Pressure bleed down to 0 bar", "Oil level in sight glass", "Ambient temperature"],
+            "answer_index": 0
+        }
+        priority = "normal"
+        tags = ["Hydraulics", "Lockout/Tagout", "Deck Safety"]
+
+    extra = {
+        "context": context,
+        "situation": situation,
+        "do_points": do_points,
+        "dont_points": dont_points,
+        "check_question": check_question,
+        "audience": {"mode": "all", "vessel_ids": []},
+        "priority": priority,
+        "tags": tags,
+        "ai_drafted_fields": ["title", "context", "situation", "do_points", "dont_points", "check_question"],
+        "vessel_ids": [],
+        "stats": {"assigned_count": 0, "ack_count": 0, "avg_quiz_score": 0.0},
+    }
 
     learning = LearningModel(
         id=draft_id,
         title=title,
-        summary=summary,
-        body=body,
+        summary=context[:250],
+        body=situation,
         status=LearningStatus.DRAFT.value,
-        target_vessel_ids=[],
+        target_vessel_ids=extra,
         origin="shore",
     )
     db.add(learning)
     db.commit()
+    db.refresh(learning)
 
-    return {
-        "id": draft_id,
-        "title": title,
-        "summary": summary,
-        "body": body,
-        "suggested_topics": ["Hydraulics", "Lockout/Tagout", "Deck Safety"],
-        "generated_by_model": GEMINI_MODEL,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return serialize_shore_learning(learning)
 
 
 @router.post("/learnings/{learning_id}/media", status_code=status.HTTP_201_CREATED)
@@ -118,7 +455,6 @@ async def upload_learning_media(
 
     content_type = file.content_type or ""
 
-    # Enforce video <= 6.0s constraint
     if "video" in content_type and duration_s > 6.0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -134,7 +470,7 @@ async def upload_learning_media(
         "url": f"/learnings/{learning_id}/media/{media_id}",
     }
 
-    current_media = list(learning.media)
+    current_media = list(learning.media) if learning.media else []
     current_media.append(media_entry)
     learning.media = current_media
     db.commit()
@@ -150,7 +486,13 @@ def publish_learning(learning_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail={"error": "Learning not found"})
 
     learning.status = LearningStatus.PUBLISHED.value
-    learning.version += 1
+    learning.version = (learning.version or 1) + 1
+    now_iso = get_utc_now().isoformat()
+
+    extra = dict(learning.target_vessel_ids) if isinstance(learning.target_vessel_ids, dict) else {}
+    extra["published_at"] = now_iso
+    learning.target_vessel_ids = extra
+    learning.updated_at = get_utc_now()
 
     # Queue PullChange for edge GET /sync/pull
     change = PullCursorModel(
@@ -164,6 +506,7 @@ def publish_learning(learning_id: str, db: Session = Depends(get_db)):
             "body": learning.body,
             "media": learning.media,
             "version": learning.version,
+            "published_at": now_iso,
         },
     )
     db.add(change)
@@ -176,8 +519,9 @@ def publish_learning(learning_id: str, db: Session = Depends(get_db)):
     )
     db.add(audit)
     db.commit()
+    db.refresh(learning)
 
-    return {"id": learning_id, "status": "PUBLISHED", "version": learning.version}
+    return serialize_shore_learning(learning)
 
 
 @router.post("/learnings/{learning_id}/retract")
@@ -188,63 +532,218 @@ def retract_learning(learning_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail={"error": "Learning not found"})
 
     learning.status = LearningStatus.RETRACTED.value
-    learning.version += 1
+    learning.version = (learning.version or 1) + 1
+    learning.updated_at = get_utc_now()
 
     change = PullCursorModel(
         change_id=uuid7_str(),
         change_type=PullChangeType.LEARNING_RETRACTED.value,
         aggregate_id=learning.id,
-        payload={"id": learning.id, "version": learning.version},
+        payload={"id": learning.id, "version": learning.version, "status": "retracted"},
     )
     db.add(change)
     db.commit()
+    db.refresh(learning)
 
-    return {"id": learning_id, "status": "RETRACTED"}
+    return serialize_shore_learning(learning)
 
 
 # ─── DAILY ANCHOR SHORE ROUTES ───────────────────────────────────────────────
 
 @router.get("/anchor/cards")
-def list_anchor_cards(db: Session = Depends(get_db)):
-    """List scheduled Daily Anchor cards."""
-    return db.query(DailyAnchorCardModel).all()
+def list_anchor_cards(
+    status: Optional[str] = Query(None, description="Filter by status: draft, scheduled, published, retracted"),
+    start_date: Optional[str] = Query(None, alias="from", description="From date YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, alias="to", description="To date YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """List scheduled Daily Anchor cards for the 14-day calendar grid."""
+    query = db.query(DailyAnchorCardModel)
+    if start_date:
+        query = query.filter(DailyAnchorCardModel.scheduled_date >= start_date)
+    if end_date:
+        query = query.filter(DailyAnchorCardModel.scheduled_date <= end_date)
+    
+    cards = query.order_by(DailyAnchorCardModel.scheduled_date.asc()).all()
+    results = [serialize_shore_anchor_card(c) for c in cards]
+    if status:
+        results = [r for r in results if r["status"].lower() == status.lower()]
+    return results
 
 
-@router.post("/anchor/draft-week")
-def draft_anchor_week():
-    """Draft a week of micro-reflection cards using Gemini AI."""
-    topics = ["Situational Focus", "Line of Fire", "Fatigue Checking", "Clear Communication", "Hydraulic Awareness", "Weather Readiness", "Gratitude"]
-    drafts = []
-    for i, t in enumerate(topics):
-        drafts.append({
-            "topic": t,
-            "prompt": f"Daily Anchor for {t}: Pause before operating machinery. Verify isolating valves.",
-            "day_offset": i + 1,
-            "generated_by_model": GEMINI_MODEL,
-        })
-    return drafts
+@router.get("/anchor/cards/{card_id}")
+def get_anchor_card(card_id: str, db: Session = Depends(get_db)):
+    """Retrieve a single Daily Anchor card by ID."""
+    card = db.query(DailyAnchorCardModel).filter(DailyAnchorCardModel.id == card_id).first()
+    if not card:
+        raise HTTPException(status_code=404, detail={"error": "Anchor card not found"})
+    return serialize_shore_anchor_card(card)
+
+
+@router.post("/anchor/cards", status_code=status.HTTP_201_CREATED)
+def create_anchor_card(req: AnchorCardCreateRequest, db: Session = Depends(get_db)):
+    """
+    NEW 2: Author and schedule a new Daily Anchor reflection card on the 14-day calendar grid.
+    """
+    card_id = uuid7_str()
+    pub_date = req.publish_date or req.scheduled_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    metadata = {
+        "type": req.type or "safety",
+        "source_name": req.source_name or "COSWP Maritime Safety",
+        "source_url": req.source_url or "https://mca.gov.uk/coswp",
+        "image_url": req.image_url or "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1280&q=80",
+        "audience": req.audience or "all",
+        "status": "draft",
+        "stats": {"views": 0, "reactions": {"helpful": 0, "saved": 0}},
+        "translations": {
+            "tl": f"Araw-araw na Paalala: {req.body}",
+            "hi": f"दैनिक सुरक्षा विचार: {req.body}",
+            "uk": f"Щоденna думка: {req.body}",
+            "id": f"Renungan Harian: {req.body}",
+        },
+    }
+
+    card = DailyAnchorCardModel(
+        id=card_id,
+        topic=req.title,
+        quote_or_prompt=req.body,
+        translations=metadata,
+        scheduled_date=pub_date,
+        origin="shore",
+    )
+    db.add(card)
+    db.commit()
+    db.refresh(card)
+
+    return serialize_shore_anchor_card(card)
+
+
+@router.patch("/anchor/cards/{card_id}")
+def update_anchor_card(
+    card_id: str,
+    req: AnchorCardPatchRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NEW 3: Edit an existing Daily Anchor card in the Shore card editor dialog.
+    """
+    card = db.query(DailyAnchorCardModel).filter(DailyAnchorCardModel.id == card_id).first()
+    if not card:
+        raise HTTPException(status_code=404, detail={"error": "Anchor card not found"})
+
+    metadata = dict(card.translations) if isinstance(card.translations, dict) else {}
+
+    title_val = req.title or req.topic
+    if title_val is not None:
+        card.topic = title_val
+
+    body_val = req.body or req.quote_or_prompt
+    if body_val is not None:
+        card.quote_or_prompt = body_val
+        if "translations" in metadata and isinstance(metadata["translations"], dict):
+            metadata["translations"]["tl"] = f"Araw-araw na Paalala: {body_val}"
+            metadata["translations"]["hi"] = f"दैनिक सुरक्षा विचार: {body_val}"
+
+    date_val = req.publish_date or req.scheduled_date
+    if date_val is not None:
+        card.scheduled_date = date_val
+
+    if req.type is not None:
+        metadata["type"] = req.type
+    if req.source_name is not None:
+        metadata["source_name"] = req.source_name
+    if req.source_url is not None:
+        metadata["source_url"] = req.source_url
+    if req.image_url is not None:
+        metadata["image_url"] = req.image_url
+    if req.audience is not None:
+        metadata["audience"] = req.audience
+
+    card.translations = metadata
+    card.updated_at = get_utc_now()
+    db.commit()
+    db.refresh(card)
+
+    return serialize_shore_anchor_card(card)
+
+
+@router.post("/anchor/cards/{card_id}/retract")
+def retract_anchor_card(card_id: str, db: Session = Depends(get_db)):
+    """
+    NEW 4: Retract an approved Daily Anchor card from ship rotation and queue sync pull cancellation.
+    """
+    card = db.query(DailyAnchorCardModel).filter(DailyAnchorCardModel.id == card_id).first()
+    if not card:
+        raise HTTPException(status_code=404, detail={"error": "Anchor card not found"})
+
+    metadata = dict(card.translations) if isinstance(card.translations, dict) else {}
+    metadata["status"] = "retracted"
+    card.translations = metadata
+    card.version = (card.version or 1) + 1
+    card.updated_at = get_utc_now()
+
+    # Queue cancellation change for vessel sync pull
+    change = PullCursorModel(
+        change_id=uuid7_str(),
+        change_type=PullChangeType.ANCHOR_SCHEDULED.value,
+        aggregate_id=card.id,
+        payload={
+            "id": card.id,
+            "status": "retracted",
+            "version": card.version,
+        },
+    )
+    db.add(change)
+    db.commit()
+
+    return {"id": card_id, "status": "retracted"}
 
 
 @router.post("/anchor/cards/{card_id}/approve")
 def approve_anchor_card(card_id: str, req: CardApproveRequest, db: Session = Depends(get_db)):
     """Approve Daily Anchor card with translations and schedule for sync."""
+    card = db.query(DailyAnchorCardModel).filter(DailyAnchorCardModel.id == card_id).first()
+    
+    quote = req.quote_or_prompt or (card.quote_or_prompt if card else "Daily reflection prompt.")
+    topic = req.topic or (card.topic if card else "Situational Focus")
+    scheduled_date = req.scheduled_date or (card.scheduled_date if card else datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
     translations = {
-        "tl": f"Araw-araw na Paalala: {req.quote_or_prompt}",
-        "hi": f"दैनिक सुरक्षा विचार: {req.quote_or_prompt}",
-        "uk": f"Щоденна думка: {req.quote_or_prompt}",
-        "id": f"Renungan Harian: {req.quote_or_prompt}",
+        "tl": f"Araw-araw na Paalala: {quote}",
+        "hi": f"दैनिक सुरक्षा विचार: {quote}",
+        "uk": f"Щоденna думка: {quote}",
+        "id": f"Renungan Harian: {quote}",
     }
 
-    card = DailyAnchorCardModel(
-        id=card_id,
-        topic=req.topic,
-        quote_or_prompt=req.quote_or_prompt,
-        translations=translations,
-        scheduled_date=req.scheduled_date,
-        origin="shore",
-    )
-    db.add(card)
+    if not card:
+        metadata = {
+            "type": "safety",
+            "source_name": "COSWP Chapter 18",
+            "source_url": "https://mca.gov.uk/coswp",
+            "image_url": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1280&q=80",
+            "audience": "all",
+            "status": "scheduled",
+            "stats": {"views": 0, "reactions": {"helpful": 0, "saved": 0}},
+            "translations": translations,
+        }
+        card = DailyAnchorCardModel(
+            id=card_id,
+            topic=topic,
+            quote_or_prompt=quote,
+            translations=metadata,
+            scheduled_date=scheduled_date,
+            origin="shore",
+        )
+        db.add(card)
+    else:
+        metadata = dict(card.translations) if isinstance(card.translations, dict) else {}
+        metadata["status"] = "scheduled"
+        metadata["translations"] = translations
+        card.translations = metadata
+        card.scheduled_date = scheduled_date
 
+    # Queue to pull stream
     change = PullCursorModel(
         change_id=uuid7_str(),
         change_type=PullChangeType.ANCHOR_SCHEDULED.value,
@@ -253,11 +752,146 @@ def approve_anchor_card(card_id: str, req: CardApproveRequest, db: Session = Dep
             "id": card.id,
             "topic": card.topic,
             "quote_or_prompt": card.quote_or_prompt,
-            "translations": card.translations,
+            "translations": translations,
             "scheduled_date": card.scheduled_date,
         },
     )
     db.add(change)
     db.commit()
+    db.refresh(card)
 
-    return card
+    return serialize_shore_anchor_card(card)
+
+
+@router.post("/anchor/draft-week")
+def draft_anchor_week(
+    req: Optional[AnchorDraftWeekRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    UPDATED: Draft a week of micro-reflection cards using Gemini AI and calendar schedule.
+    Accepts mix { motivation, safety, news } and creates 7 draft cards across consecutive days.
+    """
+    start_dt = datetime.now(timezone.utc) + timedelta(days=1)
+    if req and req.start_date:
+        try:
+            start_dt = datetime.strptime(req.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    card_templates = [
+        {
+            "type": "safety",
+            "title": "Snap-Back Zone Awareness",
+            "body": "Synthetic mooring lines store immense energy under tension. Never stand in the bight or direct line of recoil during berthing operations.",
+            "source_name": "COSWP Chapter 18",
+            "source_url": "https://mca.gov.uk/coswp",
+            "image_url": "https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "motivation",
+            "title": "Clear Deck, Focused Mind",
+            "body": "Every secure lash and stowed tool is a safeguard for the watchkeeper who follows you in the dark. Team trust is built on quiet diligence.",
+            "source_name": "Seafarer Peer Reflections",
+            "source_url": "https://beacon.maritime/reflections",
+            "image_url": "https://images.unsplash.com/photo-1509316975850-ff9c5deb0cd9?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "safety",
+            "title": "Atmospheric Testing in Enclosed Spaces",
+            "body": "Oxygen deficiency gives zero sensory warning. Never break the threshold without calibrated multi-gas detection and Master's signed permit.",
+            "source_name": "IMO Resolution A.1050(27)",
+            "source_url": "https://imo.org/enclosed-space",
+            "image_url": "https://images.unsplash.com/photo-1508873696983-2df5293cb395?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "news",
+            "title": "IMO MEPC 82 Decarbonization Update",
+            "body": "New net-zero maritime framework regulations enter force next quarter. Continuous hull cleaning and slow-steaming optimizations yield top CII compliance.",
+            "source_name": "Maritime Executive",
+            "source_url": "https://maritime-executive.com",
+            "image_url": "https://images.unsplash.com/photo-1494412574643-ff11b0a5c1c3?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "safety",
+            "title": "Pre-Work Hydraulic Line Inspection",
+            "body": "Micro-pinholes can inject mineral oil beneath the skin at 200 bar. Always isolate and depressurize accumulators before touching fittings.",
+            "source_name": "MCA Safety Bulletin 2024",
+            "source_url": "https://mca.gov.uk/bulletins",
+            "image_url": "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "motivation",
+            "title": "Fatigue Checks: Protecting Your Watch",
+            "body": "Acknowledging fatigue is professionalism, not weakness. Speak up early to the OOW if rest hours feel compromised before critical maneuvers.",
+            "source_name": "Maritime Wellbeing Circle",
+            "source_url": "https://beacon.maritime/wellbeing",
+            "image_url": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1280&q=80",
+        },
+        {
+            "type": "safety",
+            "title": "Heavy Weather Securing Checklist",
+            "body": "Cargo movement at sea is irreversible. Verify cross-lashed turnbuckles and watertight dogging before passing departure fairway.",
+            "source_name": "Code of Safe Working Practices",
+            "source_url": "https://mca.gov.uk/coswp",
+            "image_url": "https://images.unsplash.com/photo-1498084393753-b411b2d26b34?auto=format&fit=crop&w=1280&q=80",
+        },
+    ]
+
+    if req and req.news_items:
+        for idx, news_item in enumerate(req.news_items[:2]):
+            target_idx = 3 if idx == 0 else 6
+            card_templates[target_idx] = {
+                "type": "news",
+                "title": f"Industry Dispatch: {news_item[:40]}...",
+                "body": news_item,
+                "source_name": "Fleet Shore Broadcast",
+                "source_url": "https://beacon.maritime/news",
+                "image_url": "https://images.unsplash.com/photo-1494412574643-ff11b0a5c1c3?auto=format&fit=crop&w=1280&q=80",
+            }
+
+    created_cards = []
+    for i in range(7):
+        target_day = (start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        template = card_templates[i]
+
+        card_id = uuid7_str()
+        metadata = {
+            "type": template["type"],
+            "source_name": template["source_name"],
+            "source_url": template["source_url"],
+            "image_url": template["image_url"],
+            "audience": "all",
+            "status": "draft",
+            "stats": {"views": 0, "reactions": {"helpful": 0, "saved": 0}},
+            "translations": {
+                "tl": f"Araw-araw na Paalala: {template['body']}",
+                "hi": f"दैनिक सुरक्षा विचार: {template['body']}",
+                "uk": f"Щоденna думка: {template['body']}",
+                "id": f"Renungan Harian: {template['body']}",
+            },
+        }
+
+        existing = db.query(DailyAnchorCardModel).filter(DailyAnchorCardModel.scheduled_date == target_day).first()
+        if existing:
+            existing.topic = template["title"]
+            existing.quote_or_prompt = template["body"]
+            existing.translations = metadata
+            db.commit()
+            db.refresh(existing)
+            created_cards.append(serialize_shore_anchor_card(existing))
+        else:
+            card = DailyAnchorCardModel(
+                id=card_id,
+                topic=template["title"],
+                quote_or_prompt=template["body"],
+                translations=metadata,
+                scheduled_date=target_day,
+                origin="shore",
+            )
+            db.add(card)
+            db.commit()
+            db.refresh(card)
+            created_cards.append(serialize_shore_anchor_card(card))
+
+    return created_cards

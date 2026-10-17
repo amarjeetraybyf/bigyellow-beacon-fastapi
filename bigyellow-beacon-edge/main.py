@@ -71,16 +71,21 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 app.mount("/media", StaticFiles(directory=str(UPLOADS_DIR)), name="media")
 
-# Mount Routes
-app.include_router(auth_router)
-app.include_router(reports_router)
-app.include_router(master_router)
-app.include_router(ticket_messages_router)
-app.include_router(inbox_router)
-app.include_router(events_router)
-app.include_router(checkin_router)
-app.include_router(learnings_router)
-app.include_router(sync_router)
+# Mount Routes both at root and with /api/v1 prefix for direct Lovable SDK compatibility
+edge_routers = (
+    auth_router,
+    reports_router,
+    master_router,
+    ticket_messages_router,
+    inbox_router,
+    events_router,
+    checkin_router,
+    learnings_router,
+    sync_router,
+)
+for r in edge_routers:
+    app.include_router(r)
+    app.include_router(r, prefix="/api/v1")
 
 
 @app.get("/edge/docs", include_in_schema=False)
