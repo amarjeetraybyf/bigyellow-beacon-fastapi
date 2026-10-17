@@ -69,6 +69,7 @@ def generate_pairing_code(
         code=code,
         vessel_id=record.vessel_id,
         expires_at=expires_at,
+        qr_payload=f"beacon://pair?code={code}&vessel={record.vessel_id}",
     )
 
 
@@ -97,9 +98,10 @@ def pair_device(
         code_record.used = True
         db.add(code_record)
 
+    dept = req.department or "Deck"
     device_token = f"dev_{uuid7_str()}"
-    crew_id = f"CREW-{req.department.upper()}-{secrets.token_hex(3).upper()}"
-    crew_name = req.crew_name or f"Crew Member ({req.department})"
+    crew_id = req.crew_id or f"CREW-{dept.upper()}-{secrets.token_hex(3).upper()}"
+    crew_name = req.crew_name or f"Crew Member ({dept})"
     expires_at = get_utc_now() + timedelta(days=90)
 
     hashed_pin = hash_pin_argon2(pin or "1234")
@@ -108,7 +110,7 @@ def pair_device(
         id=uuid7_str(),
         token=device_token,
         vessel_id=vessel_id,
-        department=req.department,
+        department=dept,
         crew_id=crew_id,
         crew_name=crew_name,
         hashed_pin=hashed_pin,
@@ -124,7 +126,7 @@ def pair_device(
     return PairResponse(
         device_token=device_token,
         vessel_id=vessel_id,
-        department=req.department,
+        department=dept,
         expires_at=expires_at,
     )
 

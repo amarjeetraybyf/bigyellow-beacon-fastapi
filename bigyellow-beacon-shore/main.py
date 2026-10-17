@@ -53,11 +53,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router)
-app.include_router(tickets_router)
-app.include_router(learnings_router)
-app.include_router(fleet_router)
-app.include_router(sync_router)
+# Mount routers both at root and with /api/v1 prefix for direct Lovable SDK compatibility
+for r in (auth_router, tickets_router, learnings_router, fleet_router, sync_router):
+    app.include_router(r)
+    app.include_router(r, prefix="/api/v1")
 
 
 @app.get("/shore/docs", include_in_schema=False)

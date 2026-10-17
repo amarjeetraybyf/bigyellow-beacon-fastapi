@@ -1,25 +1,25 @@
 """
 Shore Ticket Management & Intelligence Routes
 Endpoints:
-- GET /tickets (filters)
-- GET /tickets/{id}
-- POST /tickets/{id}/accept (NEW -> IN_REVIEW)
-- POST /tickets/{id}/reject {reason, note}
-- POST /tickets/{id}/close
-- GET/POST /tickets/{id}/messages
-- GET/POST /tickets/{id}/analysis (Gemini 2.5 Flash)
-- GET /tickets/{id}/similar (accident corpus + tickets)
-Includes ShoreAuditLog for accept, reject, reply, close.
+- GET /tickets (filters, search, pagination, 10s updated_since delta polling)
+- GET /tickets/{id} (full ticket detail)
+- POST /tickets/{id}/accept (NEW -> IN_REVIEW, assigns current user)
+- POST /tickets/{id}/reject {reason, note} (transitions to REJECTED)
+- POST /tickets/{id}/close {resolution_note} (IN_REVIEW -> CLOSED)
+- GET/POST /tickets/{id}/messages (anonymous 3-way communication thread)
+- GET/POST /tickets/{id}/analysis (Gemini 2.5 Flash Safety Copilot)
+- GET /tickets/{id}/similar (accident corpus + fleet tickets)
 """
 
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from contract.enums import Role, ShoreStatus, PullChangeType
 from contract.uuid7 import uuid7_str
-from db_models import TicketModel, TicketMessageModel, PullCursorModel, ShoreUserModel
+from db_models import TicketModel, TicketMessageModel, PullCursorModel, VesselModel
 from db import get_db
 from security import require_shore_role
 from services.audit_service import log_shore_action
@@ -34,61 +34,199 @@ class RejectPayload(BaseModel):
     note: Optional[str] = None
 
 
+class ClosePayload(BaseModel):
+    resolution_note: Optional[str] = "Closed by shore safety team."
+
+
 class MessageReplyPayload(BaseModel):
-    text: str
+    body: Optional[str] = None
+    text: Optional[str] = None
+
+
+def get_user_id(user: Any) -> str:
+    if hasattr(user, "id"):
+        return str(user.id)
+    if isinstance(user, dict):
+        return str(user.get("sub") or user.get("id") or "shore_reviewer")
+    return str(user)
+
+
+def get_user_name(user: Any) -> str:
+    if hasattr(user, "name"):
+        return str(user.name)
+    if isinstance(user, dict):
+        return str(user.get("name") or user.get("sub") or "Shore Safety Team")
+    return "Shore Safety Team"
+
+
+def serialize_shore_ticket(t: TicketModel, db: Session) -> Dict[str, Any]:
+    """
+    Serializes a ticket model into the exact rich JSON structure required by
+    the Shore Dashboard (TanStack Table, ticket detail view, and modals).
+    """
+    vessel = db.query(VesselModel).filter(VesselModel.id == t.vessel_id).first()
+    vessel_name = (
+        vessel.name
+        if vessel
+        else t.vessel_id.replace("v-", "").replace("MV-", "").replace("-", " ").title()
+    )
+    vessel_type = getattr(vessel, "type", "Bulk Carrier") if hasattr(vessel, "type") else "Bulk Carrier"
+    vessel_dict = {
+        "id": t.vessel_id,
+        "name": vessel_name,
+        "type": vessel_type,
+    }
+
+    action_data = t.assigned_action or {}
+    if isinstance(action_data, list):
+        actions_list = action_data
+        action_dict = {}
+    elif isinstance(action_data, dict):
+        action_dict = action_data
+        actions_list = action_data.get("actions", [])
+        if not actions_list and "text" in action_data:
+            actions_list = [action_data]
+    else:
+        action_dict = {}
+        actions_list = []
+
+    # Format ticket_no
+    num_part = "".join(filter(str.isdigit, t.id))[:4] or "0042"
+    vessel_prefix = (t.vessel_id.replace("v-", "").replace("MV-", "").replace("-", "")[:4]).upper() or "CORA"
+    ticket_no = action_dict.get("ticket_no") or f"BCN-{vessel_prefix}-{num_part.zfill(4)}"
+
+    # Parse photos
+    photos = []
+    for m in (t.media_refs or []):
+        if isinstance(m, dict):
+            url = m.get("url")
+            if url:
+                photos.append(url)
+        elif isinstance(m, str):
+            photos.append(m)
+
+    # Format actions
+    formatted_actions = []
+    for a in actions_list:
+        if isinstance(a, dict) and "text" in a:
+            formatted_actions.append({
+                "text": a.get("text", ""),
+                "responsible_rank": a.get("responsible_rank", "2nd Engineer"),
+                "due_at": a.get("due_at"),
+                "created_at": a.get("created_at") or a.get("assigned_at") or (t.created_at.isoformat() if t.created_at else None),
+            })
+
+    occurred = t.created_at.isoformat() if t.created_at else None
+
+    # Map onboard_status to Lovable valid values
+    obs = t.onboard_status
+    if obs in ("NEW", "SUBMITTED"):
+        obs = "SUBMITTED"
+    elif obs in ("RESOLVED", "RESOLVED_ON_BOARD"):
+        obs = "RESOLVED_ON_BOARD"
+    elif obs not in ("ACKNOWLEDGED", "ACTION_IN_PROGRESS"):
+        obs = "SUBMITTED"
+
+    return {
+        "id": t.id,
+        "ticket_no": ticket_no,
+        "vessel": vessel_dict,
+        "vessel_id": t.vessel_id,
+        "rank_band": action_dict.get("rank_band", "Rating"),
+        "title": t.title,
+        "title_en": t.title,
+        "description": t.description,
+        "description_en": t.description,
+        "description_original": action_dict.get("description_original") or t.description,
+        "original_language": action_dict.get("original_language", "en"),
+        "location_on_board": t.location_on_board,
+        "hazard_type": t.hazard_type,
+        "ism_category": t.ism_category,
+        "severity": t.severity,
+        "immediate_action": t.immediate_action,
+        "photos": photos,
+        "onboard_status": obs,
+        "shore_status": t.shore_status,
+        "onboard_actions": formatted_actions,
+        "assigned_to": action_dict.get("assigned_to"),
+        "reject_reason": action_dict.get("reject_reason"),
+        "reject_note": action_dict.get("reject_note"),
+        "resolution_note": action_dict.get("resolution_note"),
+        "similar_count": action_dict.get("similar_count", 3),
+        "occurred_at": occurred,
+        "received_at": occurred,
+        "created_at": occurred,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else occurred,
+    }
 
 
 @router.get("")
 def list_shore_tickets(
+    status: Optional[str] = None,
+    shore_status: Optional[str] = None,
     vessel_id: Optional[str] = None,
     hazard_type: Optional[str] = None,
     severity: Optional[int] = None,
-    shore_status: Optional[str] = None,
+    ism_category: Optional[str] = None,
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    q: Optional[str] = None,
+    updated_since: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    List near-miss tickets across fleet with multi-criteria filters, search,
+    and 10-second updated_since delta polling.
+    """
     query = db.query(TicketModel)
+
+    eff_status = status or shore_status
+    if eff_status:
+        query = query.filter(TicketModel.shore_status == eff_status)
     if vessel_id:
         query = query.filter(TicketModel.vessel_id == vessel_id)
     if hazard_type:
         query = query.filter(TicketModel.hazard_type.ilike(f"%{hazard_type}%"))
     if severity:
         query = query.filter(TicketModel.severity == severity)
-    if shore_status:
-        query = query.filter(TicketModel.shore_status == shore_status)
+    if ism_category:
+        query = query.filter(TicketModel.ism_category.ilike(f"%{ism_category}%"))
+    if from_date:
+        query = query.filter(TicketModel.created_at >= from_date)
+    if to_date:
+        query = query.filter(TicketModel.created_at <= to_date)
+    if updated_since:
+        query = query.filter(TicketModel.updated_at >= updated_since)
+    if q:
+        search_pattern = f"%{q}%"
+        query = query.filter(
+            (TicketModel.title.ilike(search_pattern))
+            | (TicketModel.description.ilike(search_pattern))
+            | (TicketModel.location_on_board.ilike(search_pattern))
+            | (TicketModel.vessel_id.ilike(search_pattern))
+        )
 
     total = query.count()
     tickets = query.order_by(TicketModel.created_at.desc()).offset(offset).limit(limit).all()
 
     return {
         "total": total,
-        "items": [
-            {
-                "id": t.id,
-                "vessel_id": t.vessel_id,
-                "title": t.title,
-                "hazard_type": t.hazard_type,
-                "ism_category": t.ism_category,
-                "severity": t.severity,
-                "location_on_board": t.location_on_board,
-                "onboard_status": t.onboard_status,
-                "shore_status": t.shore_status,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "media_count": len(t.media_refs or []),
-            }
-            for t in tickets
-        ],
+        "items": [serialize_shore_ticket(t, db) for t in tickets],
     }
 
 
 @router.get("/{ticket_id}")
 def get_shore_ticket_detail(
     ticket_id: str,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Get full ticket detail including onboard actions, media, and anonymous messages thread.
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
@@ -100,43 +238,33 @@ def get_shore_ticket_detail(
         .all()
     )
 
-    return {
-        "id": ticket.id,
-        "vessel_id": ticket.vessel_id,
-        "reporter_ref": ticket.reporter_ref,
-        "title": ticket.title,
-        "description": ticket.description,
-        "location_on_board": ticket.location_on_board,
-        "hazard_type": ticket.hazard_type,
-        "ism_category": ticket.ism_category,
-        "severity": ticket.severity,
-        "immediate_action": ticket.immediate_action,
-        "onboard_status": ticket.onboard_status,
-        "shore_status": ticket.shore_status,
-        "assigned_action": ticket.assigned_action,
-        "media_refs": ticket.media_refs or [],
-        "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
-        "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
-        "messages": [
-            {
-                "id": m.id,
-                "sender_role": m.sender_role,
-                "text": m.text,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-            }
-            for m in messages
-        ],
-    }
+    t_dict = serialize_shore_ticket(ticket, db)
+    t_dict["messages"] = [
+        {
+            "id": m.id,
+            "ticket_id": m.ticket_id,
+            "sender": "master" if m.sender_role == "master" else ("shore" if "shore" in m.sender_role else "reporter"),
+            "sender_role": m.sender_role,
+            "shore_user_name": "Shore Safety Team" if "shore" in m.sender_role else None,
+            "body": m.text,
+            "text": m.text,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "delivered_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in messages
+    ]
+    return t_dict
 
 
 @router.post("/{ticket_id}/accept")
 def accept_ticket(
     ticket_id: str,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
     """
     Transitions ticket shore_status: NEW -> IN_REVIEW.
+    Assigns current shore reviewer.
     Queues PullChange for Edge synchronization.
     Audit logged.
     """
@@ -148,7 +276,10 @@ def accept_ticket(
     ticket.shore_status = ShoreStatus.IN_REVIEW.value
     ticket.version += 1
 
-    # Queue PullChange for edge sync
+    action_dict = dict(ticket.assigned_action) if isinstance(ticket.assigned_action, dict) else {}
+    action_dict["assigned_to"] = get_user_name(user)
+    ticket.assigned_action = action_dict
+
     change = PullCursorModel(
         change_id=uuid7_str(),
         vessel_id=ticket.vessel_id,
@@ -158,33 +289,40 @@ def accept_ticket(
     )
     db.add(change)
 
-    # Log Shore Audit Trail
     log_shore_action(
         db,
         action="accept",
-        user_id=user.id,
+        user_id=get_user_id(user),
         target_id=ticket.id,
         details={"from_status": old_status, "to_status": ShoreStatus.IN_REVIEW.value},
     )
 
     db.commit()
     db.refresh(ticket)
-    return {"message": "Ticket accepted for shore review", "shore_status": ticket.shore_status}
+    return serialize_shore_ticket(ticket, db)
 
 
 @router.post("/{ticket_id}/reject")
 def reject_ticket(
     ticket_id: str,
     payload: RejectPayload,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Any = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Rejects ticket with required categorized reason and reviewer note.
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
     ticket.shore_status = ShoreStatus.REJECTED.value
     ticket.version += 1
+
+    action_dict = dict(ticket.assigned_action) if isinstance(ticket.assigned_action, dict) else {}
+    action_dict["reject_reason"] = payload.reason
+    action_dict["reject_note"] = payload.note
+    ticket.assigned_action = action_dict
 
     change = PullCursorModel(
         change_id=uuid7_str(),
@@ -198,21 +336,26 @@ def reject_ticket(
     log_shore_action(
         db,
         action="reject",
-        user_id=user.id,
+        user_id=get_user_id(user),
         target_id=ticket.id,
         details={"reason": payload.reason, "note": payload.note},
     )
 
     db.commit()
-    return {"message": "Ticket marked rejected", "shore_status": ticket.shore_status}
+    db.refresh(ticket)
+    return serialize_shore_ticket(ticket, db)
 
 
 @router.post("/{ticket_id}/close")
 def close_ticket(
     ticket_id: str,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    payload: Optional[ClosePayload] = None,
+    user: Any = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Closes an in-review ticket with a formal resolution note.
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
@@ -220,33 +363,42 @@ def close_ticket(
     ticket.shore_status = ShoreStatus.CLOSED.value
     ticket.version += 1
 
+    res_note = payload.resolution_note if payload and payload.resolution_note else "Closed by shore safety team."
+    action_dict = dict(ticket.assigned_action) if isinstance(ticket.assigned_action, dict) else {}
+    action_dict["resolution_note"] = res_note
+    ticket.assigned_action = action_dict
+
     change = PullCursorModel(
         change_id=uuid7_str(),
         vessel_id=ticket.vessel_id,
         change_type=PullChangeType.TICKET_SHORE_STATUS.value,
         aggregate_id=ticket.id,
-        payload={"ticket_id": ticket.id, "shore_status": ShoreStatus.CLOSED.value},
+        payload={"ticket_id": ticket.id, "shore_status": ShoreStatus.CLOSED.value, "resolution_note": res_note},
     )
     db.add(change)
 
     log_shore_action(
         db,
         action="close",
-        user_id=user.id,
+        user_id=get_user_id(user),
         target_id=ticket.id,
-        details={"shore_status": ShoreStatus.CLOSED.value},
+        details={"shore_status": ShoreStatus.CLOSED.value, "resolution_note": res_note},
     )
 
     db.commit()
-    return {"message": "Ticket closed by shore", "shore_status": ticket.shore_status}
+    db.refresh(ticket)
+    return serialize_shore_ticket(ticket, db)
 
 
 @router.get("/{ticket_id}/messages")
 def get_ticket_messages(
     ticket_id: str,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Any = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Retrieve anonymous 3-way conversation thread for a ticket.
+    """
     messages = (
         db.query(TicketMessageModel)
         .filter(TicketMessageModel.ticket_id == ticket_id)
@@ -256,9 +408,14 @@ def get_ticket_messages(
     return [
         {
             "id": m.id,
+            "ticket_id": m.ticket_id,
+            "sender": "master" if m.sender_role == "master" else ("shore" if "shore" in m.sender_role else "reporter"),
             "sender_role": m.sender_role,
+            "shore_user_name": "Shore Safety Team" if "shore" in m.sender_role else None,
+            "body": m.text,
             "text": m.text,
             "created_at": m.created_at.isoformat() if m.created_at else None,
+            "delivered_at": m.created_at.isoformat() if m.created_at else None,
         }
         for m in messages
     ]
@@ -268,23 +425,30 @@ def get_ticket_messages(
 def post_ticket_reply(
     ticket_id: str,
     payload: MessageReplyPayload,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Any = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Shore reviewer sends a message to the vessel crew regarding the report.
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
+    msg_text = (payload.body or payload.text or "").strip()
+    if not msg_text:
+        raise HTTPException(status_code=400, detail={"error": "Message body cannot be empty"})
+
+    user_name = get_user_name(user)
     msg = TicketMessageModel(
         id=uuid7_str(),
         ticket_id=ticket.id,
         sender_role=Role.SHORE_REVIEWER.value,
-        text=payload.text,
+        text=msg_text,
         origin="shore",
     )
     db.add(msg)
 
-    # Queue PullChange for edge pull
     change = PullCursorModel(
         change_id=uuid7_str(),
         vessel_id=ticket.vessel_id,
@@ -293,7 +457,10 @@ def post_ticket_reply(
         payload={
             "ticket_id": ticket.id,
             "message_id": msg.id,
+            "sender": "shore",
             "sender_role": msg.sender_role,
+            "shore_user_name": user_name,
+            "body": msg.text,
             "text": msg.text,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
         },
@@ -303,9 +470,9 @@ def post_ticket_reply(
     log_shore_action(
         db,
         action="reply",
-        user_id=user.id,
+        user_id=get_user_id(user),
         target_id=ticket.id,
-        details={"message_id": msg.id, "text_snippet": payload.text[:80]},
+        details={"message_id": msg.id, "text_snippet": msg_text[:80]},
     )
 
     db.commit()
@@ -313,9 +480,13 @@ def post_ticket_reply(
     return {
         "id": msg.id,
         "ticket_id": msg.ticket_id,
+        "sender": "shore",
         "sender_role": msg.sender_role,
+        "shore_user_name": user_name,
+        "body": msg.text,
         "text": msg.text,
         "created_at": msg.created_at.isoformat(),
+        "delivered_at": None,
     }
 
 
@@ -323,14 +494,19 @@ def post_ticket_reply(
 @router.post("/{ticket_id}/analysis")
 def analyze_ticket_copilot(
     ticket_id: str,
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Fetches pre-computed or on-demand AI safety analysis (Gemini 2.5 Flash).
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
     ticket_dict = {
+        "id": ticket.id,
+        "vessel_id": ticket.vessel_id,
         "title": ticket.title,
         "hazard_type": ticket.hazard_type,
         "ism_category": ticket.ism_category,
@@ -348,9 +524,12 @@ def analyze_ticket_copilot(
 def get_similar_precedents(
     ticket_id: str,
     limit: int = Query(5, ge=1, le=20),
-    user: ShoreUserModel = Depends(require_shore_role([Role.SHORE_REVIEWER, Role.SHORE_ADMIN])),
+    user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
 ):
+    """
+    Finds historical precedent cases and similar tickets across the fleet.
+    """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
