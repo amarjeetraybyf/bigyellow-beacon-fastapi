@@ -11,6 +11,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import PORT, HOST, DEBUG, ROOT_PATH
 from db import init_shore_db
+from logging_config import logger, RequestLoggingMiddleware
 from routes.auth_routes import router as auth_router
 from routes.learnings_routes import router as learnings_router
 from routes.tickets_routes import router as tickets_router
@@ -21,11 +22,11 @@ from routes.sync_routes import router as sync_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_shore_db()
-    print("================================================================")
-    print("🏢 BigYellow Beacon Shore Server Running (Cloud Run)")
-    print(f"📡 Port: http://{HOST}:{PORT}")
-    print(f"📖 Swagger Docs: http://{HOST}:{PORT}{ROOT_PATH}/docs")
-    print("================================================================")
+    logger.info("================================================================")
+    logger.info("🏢 BigYellow Beacon Shore Server Running (Cloud Run)")
+    logger.info(f"📡 Port: http://{HOST}:{PORT}")
+    logger.info(f"📖 Swagger Docs: http://{HOST}:{PORT}{ROOT_PATH}/docs")
+    logger.info("================================================================")
     yield
 
 
@@ -40,14 +41,24 @@ app = FastAPI(
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    logger.warning(f"HTTP {exc.status_code} on {request.method} {request.url.path}: {exc.detail}")
     if isinstance(exc.detail, dict):
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
 
 
+# Middleware execution order: RequestLoggingMiddleware logs processed requests inside CORS
+app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8080",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
