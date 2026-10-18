@@ -60,6 +60,7 @@ def get_sync_status(
     return {
         "link": link_str,
         "link_status": sync_worker.link_status,
+        "worker_running": sync_worker.is_running,
         "last_push_at": last_sync,
         "last_pull_at": last_sync,
         "outbox_pending": pending_count,
