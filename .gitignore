@@ -9,3 +9,4 @@ firebase-key.json
 *.db
 *.plan.md
 .venv-verify/
+.DS_Store

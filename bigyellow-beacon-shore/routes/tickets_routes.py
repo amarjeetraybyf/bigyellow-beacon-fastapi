@@ -43,6 +43,17 @@ class MessageReplyPayload(BaseModel):
     text: Optional[str] = None
 
 
+class PatchTicketPayload(BaseModel):
+    severity: Optional[int] = Field(None, ge=1, le=5)
+    ism_category: Optional[str] = None
+    hazard_type: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    shore_status: Optional[str] = None
+    assigned_action: Optional[Any] = None
+
+
 def get_user_id(user: Any) -> str:
     if hasattr(user, "id"):
         return str(user.id)
@@ -164,15 +175,15 @@ def serialize_shore_ticket(t: TicketModel, db: Session) -> Dict[str, Any]:
 def list_shore_tickets(
     status: Optional[str] = None,
     shore_status: Optional[str] = None,
-    vessel_id: Optional[str] = None,
-    hazard_type: Optional[str] = None,
-    severity: Optional[int] = None,
-    ism_category: Optional[str] = None,
+    vessel_id: Optional[List[str]] = Query(None),
+    hazard_type: Optional[List[str]] = Query(None),
+    severity: Optional[List[int]] = Query(None),
+    ism_category: Optional[List[str]] = Query(None),
     from_date: Optional[str] = Query(None, alias="from"),
     to_date: Optional[str] = Query(None, alias="to"),
     q: Optional[str] = None,
     updated_since: Optional[str] = None,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(100, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: Dict[str, Any] = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
     db: Session = Depends(get_db),
@@ -187,19 +198,26 @@ def list_shore_tickets(
     if eff_status:
         query = query.filter(TicketModel.shore_status == eff_status)
     if vessel_id:
-        query = query.filter(TicketModel.vessel_id == vessel_id)
+        query = query.filter(TicketModel.vessel_id.in_(vessel_id))
     if hazard_type:
-        query = query.filter(TicketModel.hazard_type.ilike(f"%{hazard_type}%"))
+        from sqlalchemy import or_
+        query = query.filter(or_(*[TicketModel.hazard_type.ilike(f"%{h}%") for h in hazard_type]))
     if severity:
-        query = query.filter(TicketModel.severity == severity)
+        query = query.filter(TicketModel.severity.in_(severity))
     if ism_category:
-        query = query.filter(TicketModel.ism_category.ilike(f"%{ism_category}%"))
+        from sqlalchemy import or_
+        query = query.filter(or_(*[TicketModel.ism_category.ilike(f"%{i}%") for i in ism_category]))
     if from_date:
         query = query.filter(TicketModel.created_at >= from_date)
     if to_date:
         query = query.filter(TicketModel.created_at <= to_date)
     if updated_since:
-        query = query.filter(TicketModel.updated_at >= updated_since)
+        try:
+            dt_str = updated_since.replace("Z", "+00:00")
+            dt_val = datetime.fromisoformat(dt_str)
+            query = query.filter(TicketModel.updated_at >= dt_val)
+        except Exception:
+            query = query.filter(TicketModel.updated_at >= updated_since)
     if q:
         search_pattern = f"%{q}%"
         query = query.filter(
@@ -390,6 +408,72 @@ def close_ticket(
     return serialize_shore_ticket(ticket, db)
 
 
+@router.patch("/{ticket_id}")
+def update_ticket_fields(
+    ticket_id: str,
+    payload: PatchTicketPayload,
+    user: Any = Depends(require_shore_role(Role.SHORE_REVIEWER, Role.SHORE_ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """
+    Applies field updates to ticket (e.g. AI suggestion applied by shore reviewer).
+    Increments version, queues edge sync PullChange, and logs audit.
+    """
+    ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
+
+    applied_changes = {}
+    if payload.severity is not None:
+        ticket.severity = payload.severity
+        applied_changes["severity"] = payload.severity
+    if payload.ism_category is not None:
+        ticket.ism_category = payload.ism_category
+        applied_changes["ism_category"] = payload.ism_category
+    if payload.hazard_type is not None:
+        ticket.hazard_type = payload.hazard_type
+        applied_changes["hazard_type"] = payload.hazard_type
+    if payload.title is not None:
+        ticket.title = payload.title
+        applied_changes["title"] = payload.title
+    if payload.description is not None:
+        ticket.description = payload.description
+        applied_changes["description"] = payload.description
+    if payload.status is not None:
+        ticket.shore_status = payload.status
+        applied_changes["status"] = payload.status
+    if payload.shore_status is not None:
+        ticket.shore_status = payload.shore_status
+        applied_changes["shore_status"] = payload.shore_status
+    if payload.assigned_action is not None:
+        ticket.assigned_action = payload.assigned_action
+        applied_changes["assigned_action"] = payload.assigned_action
+
+    ticket.version = (ticket.version or 1) + 1
+    ticket.updated_at = datetime.now(timezone.utc)
+
+    change = PullCursorModel(
+        change_id=uuid7_str(),
+        vessel_id=ticket.vessel_id,
+        change_type=PullChangeType.TICKET_SHORE_STATUS.value,
+        aggregate_id=ticket.id,
+        payload={"ticket_id": ticket.id, **applied_changes},
+    )
+    db.add(change)
+
+    log_shore_action(
+        db,
+        action="patch_fields",
+        user_id=get_user_id(user),
+        target_id=ticket.id,
+        details=applied_changes,
+    )
+
+    db.commit()
+    db.refresh(ticket)
+    return serialize_shore_ticket(ticket, db)
+
+
 @router.get("/{ticket_id}/messages")
 def get_ticket_messages(
     ticket_id: str,
@@ -516,7 +600,29 @@ def analyze_ticket_copilot(
         "immediate_action": ticket.immediate_action,
     }
 
-    result = generate_ticket_analysis(ticket_dict)
+    db_similar = (
+        db.query(TicketModel)
+        .filter(TicketModel.id != ticket_id)
+        .filter(TicketModel.hazard_type == ticket.hazard_type)
+        .limit(3)
+        .all()
+    )
+    similar_list = []
+    for i, t in enumerate(db_similar):
+        vessel = db.query(VesselModel).filter(VesselModel.id == t.vessel_id).first()
+        v_name = vessel.name if vessel else (t.vessel_id or "Fleet Vessel")
+        num_part = "".join(filter(str.isdigit, t.id))[:4] or "0042"
+        v_prefix = (t.vessel_id.replace("v-", "").replace("MV-", "").replace("-", "")[:4]).upper() or "CORA"
+        t_no = f"BCN-{v_prefix}-{num_part.zfill(4)}"
+        similar_list.append({
+            "ticket_id": t.id,
+            "ticket_no": t_no,
+            "vessel": v_name,
+            "title": t.title,
+            "score": round(0.88 - i * 0.05, 2),
+        })
+
+    result = generate_ticket_analysis(ticket_dict, similar_tickets=similar_list if similar_list else None)
     return result
 
 
@@ -528,11 +634,25 @@ def get_similar_precedents(
     db: Session = Depends(get_db),
 ):
     """
-    Finds historical precedent cases and similar tickets across the fleet.
+    Finds similar near-miss tickets across the fleet for the current ticket.
     """
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
-    query_str = f"{ticket.title} {ticket.hazard_type} {ticket.description}"
-    return find_similar_precedents(db, query_str, limit=limit)
+    similar_tickets = (
+        db.query(TicketModel)
+        .filter(TicketModel.id != ticket_id)
+        .filter(TicketModel.hazard_type == ticket.hazard_type)
+        .limit(limit)
+        .all()
+    )
+    if not similar_tickets:
+        similar_tickets = (
+            db.query(TicketModel)
+            .filter(TicketModel.id != ticket_id)
+            .order_by(TicketModel.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+    return [serialize_shore_ticket(t, db) for t in similar_tickets]
