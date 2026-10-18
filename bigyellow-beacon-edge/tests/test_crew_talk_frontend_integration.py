@@ -271,14 +271,39 @@ def test_crew_talk_content_and_master():
         )
         assert action_t.status_code == 200
 
-    # Morning brief
+    # Morning brief — FE MorningBrief contract
     brief_res = client.get("/master/brief", headers=master_headers)
     assert brief_res.status_code == 200
-    assert "headline" in brief_res.json()
+    brief = brief_res.json()
+    for key in (
+        "generated_at",
+        "headline",
+        "rest_hours_risk",
+        "mood_trend",
+        "open_hazards",
+        "recommended_action",
+        "fleet_context",
+    ):
+        assert key in brief
+    assert brief["rest_hours_risk"]["level"] in ("low", "medium", "high")
+    assert "note" in brief["rest_hours_risk"]
+    # Privacy: mood_trend is null unless n >= 5
+    if brief["mood_trend"] is not None:
+        assert brief["mood_trend"]["n"] >= 5
+        assert isinstance(brief["mood_trend"]["points"], list)
+    assert isinstance(brief["open_hazards"], list)
+    for hz in brief["open_hazards"]:
+        assert "ticket_no" in hz and hz["ticket_no"].startswith("BCN-")
+        assert "title" in hz and "severity" in hz
+    # Severity sorted desc when multiple hazards
+    if len(brief["open_hazards"]) >= 2:
+        sevs = [h["severity"] for h in brief["open_hazards"]]
+        assert sevs == sorted(sevs, reverse=True)
 
     regen_res = client.post("/master/brief/regenerate", headers=master_headers)
     assert regen_res.status_code == 200
-    assert "headline" in regen_res.json()
+    regen = regen_res.json()
+    assert "generated_at" in regen and "headline" in regen
 
     # Master learning stats
     stats_res = client.get("/master/learnings/stats", headers=master_headers)
