@@ -23,7 +23,7 @@ from sqlalchemy import func
 
 from contract.enums import Role, OnboardStatus, SSEEvent
 from contract.uuid7 import uuid7_str
-from contract.models import TicketAction
+from contract.models import TicketAction, to_utc_iso
 from db_models import (
     TicketModel,
     OutboxModel,
@@ -206,10 +206,10 @@ async def assign_or_resolve_action(
         "id": uuid7_str(),
         "text": text,
         "responsible_rank": responsible_rank,
-        "due_at": due_str,
-        "assigned_at": datetime.now(timezone.utc).isoformat(),
+        "due_at": to_utc_iso(due_str),
+        "assigned_at": to_utc_iso(datetime.now(timezone.utc)),
         "resolved": resolve,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": to_utc_iso(datetime.now(timezone.utc)),
     }
     if photo_url:
         action_payload["photo_url"] = photo_url
@@ -531,7 +531,7 @@ def list_welfare_requests(
         {
             "id": r.id,
             "name": r.crew_name,
-            "created_at": r.requested_at.isoformat() if r.requested_at else datetime.now(timezone.utc).isoformat(),
+            "created_at": to_utc_iso(r.requested_at or datetime.now(timezone.utc)),
             # FE: pending | acknowledged | contacted
             "status": "acknowledged" if r.acknowledged else "pending",
             "acknowledged": r.acknowledged,
@@ -559,7 +559,7 @@ def acknowledge_welfare_request(
     return {
         "id": req_id,
         "name": welfare.crew_name,
-        "created_at": welfare.requested_at.isoformat() if welfare.requested_at else datetime.now(timezone.utc).isoformat(),
+        "created_at": to_utc_iso(welfare.requested_at or datetime.now(timezone.utc)),
         "status": "contacted" if (req_body and req_body.status == "contacted") else "acknowledged",
         "acknowledged": True,
     }
@@ -577,7 +577,7 @@ def master_devices(
             "id": d.id,
             "crew_name": d.crew_name,
             "rank": d.department,
-            "paired_at": d.created_at.isoformat() if d.created_at else datetime.now(timezone.utc).isoformat(),
+            "paired_at": to_utc_iso(d.created_at or datetime.now(timezone.utc)),
         }
         for d in devices
     ]
@@ -625,7 +625,7 @@ def list_crew_members(
             "rank_band": a.rank_band,
             "role": a.role,
             "language": a.language,
-            "created_at": a.created_at.isoformat() if a.created_at else datetime.now(timezone.utc).isoformat(),
+            "created_at": to_utc_iso(a.created_at or datetime.now(timezone.utc)),
         }
         for a in accounts
     ]
@@ -686,7 +686,7 @@ def create_crew_member(
         "rank_band": acc.rank_band,
         "role": acc.role,
         "language": acc.language,
-        "created_at": acc.created_at.isoformat(),
+        "created_at": to_utc_iso(acc.created_at or datetime.now(timezone.utc)),
     }
 
 

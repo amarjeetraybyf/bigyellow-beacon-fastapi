@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, SSEEvent
 from contract.uuid7 import uuid7_str
-from contract.models import TicketMessageCreate
+from contract.models import TicketMessageCreate, to_utc_iso
 from db_models import TicketModel, TicketMessageModel, OutboxModel
 from db import get_db
 from auth import get_current_edge_user
@@ -52,7 +52,7 @@ def list_ticket_messages(
             "sender_role": m.sender_role,
             "body": m.text,
             "text": m.text,
-            "created_at": m.created_at.isoformat() if m.created_at else datetime.now(timezone.utc).isoformat(),
+            "created_at": to_utc_iso(m.created_at or datetime.now(timezone.utc)),
         }
         for m in messages
     ]
@@ -75,13 +75,14 @@ def post_ticket_message(
     scrubbed_text = scrub_pii(raw_text)
     user_role = user.get("role", "crew")
     sender_role = "master" if user_role == Role.MASTER or user_role == "master" else "crew"
+    now_utc = datetime.now(timezone.utc)
 
     msg = TicketMessageModel(
         id=msg_id,
         ticket_id=ticket_id,
         sender_role=sender_role,
         text=scrubbed_text,
-        created_at=datetime.now(timezone.utc),
+        created_at=now_utc,
     )
 
     outbox = OutboxModel(
@@ -94,7 +95,7 @@ def post_ticket_message(
             "ticket_id": ticket_id,
             "sender_role": sender_role,
             "text": scrubbed_text,
-            "created_at": msg.created_at.isoformat(),
+            "created_at": to_utc_iso(now_utc),
         },
         severity=ticket.severity,
         synced=False,
@@ -115,7 +116,7 @@ def post_ticket_message(
             "sender": sse_sender,
             "sender_role": sender_role,
             "body": scrubbed_text,
-            "created_at": msg.created_at.isoformat(),
+            "created_at": to_utc_iso(now_utc),
         },
     )
 
@@ -126,7 +127,7 @@ def post_ticket_message(
         "sender_role": sender_role,
         "body": scrubbed_text,
         "text": scrubbed_text,
-        "created_at": msg.created_at.isoformat(),
+        "created_at": to_utc_iso(now_utc),
     }
 
 

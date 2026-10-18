@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from contract.enums import Role
+from contract.models import to_utc_iso
 from db_models import (
     VesselModel,
     TicketModel,
@@ -33,7 +34,7 @@ def list_vessels(
     db: Session = Depends(get_db),
 ):
     vessels = db.query(VesselModel).all()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = to_utc_iso(datetime.now(timezone.utc))
     return [
         {
             "id": v.id,
@@ -42,8 +43,8 @@ def list_vessels(
             "imo": v.imo_number,
             "imo_number": v.imo_number,
             "flag": "Marshall Islands" if "star" in v.name.lower() else ("Panama" if "trader" in v.name.lower() else "Singapore"),
-            "last_sync_at": v.last_sync_timestamp.isoformat() if v.last_sync_timestamp else now_iso,
-            "last_sync_timestamp": v.last_sync_timestamp.isoformat() if v.last_sync_timestamp else None,
+            "last_sync_at": to_utc_iso(v.last_sync_timestamp) or now_iso,
+            "last_sync_timestamp": to_utc_iso(v.last_sync_timestamp),
             "crew_count": 22 if "star" in v.name.lower() else 24,
             "connection_status": v.connection_status or "ONLINE",
         }
@@ -166,8 +167,8 @@ def get_fleet_overview(
                 "fatigue_trend": trends_cycle[(idx + 1) % 3],
             })
 
-    sync_timestamps = [v.last_sync_timestamp.isoformat() for v in vessels if v.last_sync_timestamp]
-    last_ship_sync_at = max(sync_timestamps) if sync_timestamps else now_utc.isoformat()
+    sync_timestamps = [to_utc_iso(v.last_sync_timestamp) for v in vessels if v.last_sync_timestamp]
+    last_ship_sync_at = max(sync_timestamps) if sync_timestamps else to_utc_iso(now_utc)
 
     return {
         "open_by_severity": open_by_severity,
@@ -219,7 +220,7 @@ def get_fleet_clusters(
             "severity": t.severity,
             "title": t.title,
             "hazard_type": hazard_val,
-            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "created_at": to_utc_iso(t.created_at),
         })
 
     cluster_list = []

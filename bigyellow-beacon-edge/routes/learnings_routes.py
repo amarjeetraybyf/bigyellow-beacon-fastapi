@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from contract.enums import Role, LearningStatus
+from contract.models import to_utc_iso
 from db_models import LearningModel, DailyAnchorCardModel
 from db import get_db
 from auth import get_current_edge_user
@@ -77,7 +78,7 @@ def format_learning(l: Any) -> Dict[str, Any]:
     summary = getattr(l, "summary", "Two vessels in the fleet had slips near deck cranes this month.")
     body = getattr(l, "body", "A slewing unit seal failed and oil spread across walkway.")
     created_at = getattr(l, "created_at", None)
-    created_iso = created_at.isoformat() if created_at else datetime.now(timezone.utc).isoformat()
+    created_iso = to_utc_iso(created_at or datetime.now(timezone.utc))
 
     return {
         "id": lid,
