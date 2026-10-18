@@ -13,12 +13,62 @@ from contract.enums import (
     ShoreStatus,
     LearningStatus,
     PullChangeType,
+    HazardType,
+    IsmCategory,
 )
 from contract.uuid7 import uuid7_str
 
 
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def normalize_hazard_type(raw: Optional[str]) -> str:
+    """Map free-text / legacy labels to frontend HazardType enum values."""
+    if not raw:
+        return HazardType.OTHER.value
+    value = str(raw).strip().lower().replace(" ", "_").replace("-", "_").replace("/", "_")
+    for ht in HazardType:
+        if value == ht.value or value == ht.name.lower():
+            return ht.value
+    text = str(raw).lower()
+    if any(w in text for w in ("slip", "trip", "fall", "wet deck")):
+        return HazardType.SLIP_TRIP_FALL.value
+    if any(w in text for w in ("mooring", "snap", "winch", "rope", "line parting")):
+        return HazardType.MOORING.value
+    if any(w in text for w in ("crane", "lifting", "hoist", "cargo gear")):
+        return HazardType.CRANE_LIFTING.value
+    if any(w in text for w in ("enclosed", "confined", "ballast tank", "oxygen", "atmosphere")):
+        return HazardType.ENCLOSED_SPACE.value
+    if any(w in text for w in ("fire", "flammable", "ignition", "smoke")):
+        return HazardType.FIRE.value
+    if any(w in text for w in ("electric", "wiring", "cable", "shock")):
+        return HazardType.ELECTRICAL.value
+    if any(w in text for w in ("chemical", "corrosive", "toxic", "hazmat")):
+        return HazardType.CHEMICAL.value
+    if any(w in text for w in ("machiner", "engine", "hydraulic", "pump", "leak", "oil", "fuel", "pipe")):
+        return HazardType.MACHINERY.value
+    return HazardType.OTHER.value
+
+
+def normalize_ism_category(raw: Optional[str]) -> str:
+    """Map free-text / ISM code labels to frontend IsmCategory enum values."""
+    if not raw:
+        return IsmCategory.UNSAFE_CONDITION.value
+    value = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+    for ic in IsmCategory:
+        if value == ic.value or value == ic.name.lower():
+            return ic.value
+    text = str(raw).lower()
+    if any(w in text for w in ("unsafe_act", "unsafe act", "human error", "procedure not followed")):
+        return IsmCategory.UNSAFE_ACT.value
+    if any(w in text for w in ("equipment", "failure", "breakdown", "defect", "ism 10", "maintenance")):
+        return IsmCategory.EQUIPMENT_FAILURE.value
+    if any(w in text for w in ("procedure", "gap", "permit", "checklist", "ism 7", "operations")):
+        return IsmCategory.PROCEDURE_GAP.value
+    if any(w in text for w in ("unsafe_condition", "unsafe condition", "condition", "hazard")):
+        return IsmCategory.UNSAFE_CONDITION.value
+    return IsmCategory.UNSAFE_CONDITION.value
 
 
 class SyncedBaseModel(BaseModel):
@@ -40,13 +90,19 @@ class TicketFields(BaseModel):
     severity: int = Field(..., ge=1, le=5)
     immediate_action: str
 
+    @model_validator(mode="after")
+    def _normalize_enums(self):
+        self.hazard_type = normalize_hazard_type(self.hazard_type)
+        self.ism_category = normalize_ism_category(self.ism_category)
+        return self
+
 
 class TicketStructureResponse(BaseModel):
     draft_id: str
     original_language: str
     transcript_original: str
     fields: TicketFields
-    clarifying_question: str
+    clarifying_question: Optional[str] = None
     confidence: float = 0.95
 
 

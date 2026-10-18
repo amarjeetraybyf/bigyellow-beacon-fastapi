@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from contract.models import TicketFields
+from contract.enums import HazardType, IsmCategory
 from db_models import TicketModel
 from config import (
     OLLAMA_HOST,
@@ -200,6 +201,15 @@ class AIGateway:
         if self.check_safety_rails(f"{parsed_fields.title_en} {parsed_fields.description_en}"):
             raise SafetyRailTriggeredException()
 
+        location = (parsed_fields.location_on_board or "").strip()
+        location_known = bool(location) and location.lower() not in (
+            "unknown", "n/a", "na", "tbd", "deck / machinery space",
+        )
+        if location_known:
+            clarifying = model_clarifying_question if model_clarifying_question else None
+        else:
+            clarifying = model_clarifying_question or DEFAULT_CLARIFYING_QUESTION
+
         duplicate_info = None
         if db:
             duplicate_info = await self.check_duplicate_tickets(
@@ -208,13 +218,30 @@ class AIGateway:
 
         return {
             "draft_id": draft_id,
-            "original_language": "en",
+            "original_language": self.detect_language(input_text),
             "transcript_original": input_text,
             "fields": parsed_fields.model_dump(),
-            "clarifying_question": model_clarifying_question or DEFAULT_CLARIFYING_QUESTION,
+            "clarifying_question": clarifying,
             "confidence": model_confidence if model_confidence is not None else 0.94,
             "duplicate_info": duplicate_info,
         }
+
+    @staticmethod
+    def detect_language(text: str) -> str:
+        """Lightweight script heuristic for original_language (FE expects e.g. en/hi)."""
+        if not text:
+            return "en"
+        # Devanagari
+        if re.search(r"[\u0900-\u097F]", text):
+            return "hi"
+        # Cyrillic (Ukrainian/Russian crew)
+        if re.search(r"[\u0400-\u04FF]", text):
+            return "uk"
+        # Arabic / Urdu
+        if re.search(r"[\u0600-\u06FF]", text):
+            return "ar"
+        # Tagalog/Latin-heavy default
+        return "en"
 
     @staticmethod
     def _parse_structure_json(raw: str):
@@ -360,26 +387,49 @@ class AIGateway:
     # ------------------------------------------------------------------
     def _generate_fallback_fields(self, input_text: str) -> TicketFields:
         lower = input_text.lower()
-        hazard = "General Maritime Hazard"
-        ism = "ISM 7 - Shipboard Operations"
+        hazard = HazardType.OTHER.value
+        ism = IsmCategory.UNSAFE_CONDITION.value
         location = "Deck / Machinery Space"
         sev = 3
 
         if any(w in lower for w in ("slip", "trip", "fall", "water", "wet", "deck")):
-            hazard = "Slips, Trips & Falls"
+            hazard = HazardType.SLIP_TRIP_FALL.value
+            ism = IsmCategory.UNSAFE_CONDITION.value
             location = "Main Deck Walkway"
             sev = 2
-        elif any(w in lower for w in ("fuel", "oil", "pipe", "engine", "leak", "fire")):
-            hazard = "Machinery Space Flammable Fluid Leak"
-            ism = "ISM 10 - Maintenance of Ship and Equipment"
+        elif any(w in lower for w in ("fire", "smoke", "ignition")):
+            hazard = HazardType.FIRE.value
+            ism = IsmCategory.EQUIPMENT_FAILURE.value
+            location = "Engine Room Platform"
+            sev = 4
+        elif any(w in lower for w in ("fuel", "oil", "pipe", "engine", "leak", "hydraulic")):
+            hazard = HazardType.MACHINERY.value
+            ism = IsmCategory.EQUIPMENT_FAILURE.value
             location = "Engine Room Platform"
             sev = 4
         elif any(w in lower for w in ("mooring", "rope", "wire", "line", "snap", "winch")):
-            hazard = "Mooring & Rigging Snap-Back Zone"
+            hazard = HazardType.MOORING.value
+            ism = IsmCategory.UNSAFE_ACT.value
             location = "Poop Deck / Forecastle"
             sev = 4
+        elif any(w in lower for w in ("crane", "lifting", "hoist")):
+            hazard = HazardType.CRANE_LIFTING.value
+            ism = IsmCategory.PROCEDURE_GAP.value
+            location = "Main Deck Crane Station"
+            sev = 4
+        elif any(w in lower for w in ("electric", "wiring", "cable", "shock")):
+            hazard = HazardType.ELECTRICAL.value
+            ism = IsmCategory.UNSAFE_CONDITION.value
+            location = "Accommodation / Machinery Space"
+            sev = 3
+        elif any(w in lower for w in ("chemical", "corrosive", "toxic")):
+            hazard = HazardType.CHEMICAL.value
+            ism = IsmCategory.PROCEDURE_GAP.value
+            location = "Chemical Store / Deck"
+            sev = 4
         elif any(w in lower for w in ("gas", "oxygen", "tank", "enclosed", "confined")):
-            hazard = "Enclosed Space Atmospheric Hazard"
+            hazard = HazardType.ENCLOSED_SPACE.value
+            ism = IsmCategory.PROCEDURE_GAP.value
             location = "Ballast Tank / Cofferdam"
             sev = 5
 

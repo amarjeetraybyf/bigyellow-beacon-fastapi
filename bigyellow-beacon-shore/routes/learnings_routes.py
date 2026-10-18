@@ -364,6 +364,14 @@ def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_
         key_safety_action=req.key_safety_action or "Review safety controls and procedure compliance.",
     )
 
+    extra = {
+        "context": draft["summary"],
+        "situation": draft["body"],
+        "ai_drafted_fields": ["title", "summary", "body"],
+        "vessel_ids": [],
+        "generated_by_model": draft.get("model", "deterministic-fallback"),
+    }
+
     learning = LearningModel(
         id=draft_id,
         title=draft["title"],
