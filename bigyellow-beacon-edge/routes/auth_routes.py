@@ -310,8 +310,8 @@ def login(
         u = req.username.strip().lower()
         pwd = (req.password or req.pin or "").strip()
 
-        # If pure numeric PIN is provided, validate expected length (4 crew, 6 master)
-        if req.pin and req.pin.isdigit():
+        # If pure numeric PIN is provided without password, validate expected length (4 crew, 6 master)
+        if req.pin and req.pin.isdigit() and not req.password:
             is_m = u in ("master", "u-master")
             if not is_m:
                 chk = db.query(CrewAccountModel).filter(func.lower(CrewAccountModel.username) == u).first()
