@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, OnboardStatus, ShoreStatus, SSEEvent
 from contract.uuid7 import uuid7_str
-from contract.models import TicketFields, TicketStructureResponse
+from contract.models import TicketFields, TicketStructureResponse, normalize_hazard_type, normalize_ism_category
 from db_models import TicketModel, OutboxModel, DeviceModel
 from config import VESSEL_ID, PORT
 from db import get_db
@@ -59,13 +59,22 @@ def to_public_url(path_or_url: Optional[str]) -> Optional[str]:
     return f"{PUBLIC_BASE_URL}{path_or_url}"
 
 
-def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Optional[str] = None) -> Dict[str, Any]:
+def ticket_to_dict(
+    t: TicketModel,
+    share_name: bool = False,
+    reporter_name: Optional[str] = None,
+    reporter_id: Optional[str] = None,
+) -> Dict[str, Any]:
     num_part = "".join(filter(str.isdigit, t.id))[:4] or "0101"
-    ticket_no = f"BCN-{t.vessel_id[:4]}-{num_part.zfill(4)}"
+    ticket_no = f"BCN-{(t.vessel_id or VESSEL_ID)[:4]}-{num_part.zfill(4)}"
     actions = []
     r_name = reporter_name
+    r_id = reporter_id
     s_name = share_name
     stored_audio_url: Optional[str] = None
+    description_original: Optional[str] = None
+    original_language = "en"
+    reject_reason: Optional[str] = None
 
     raw_actions = t.assigned_action or []
     if isinstance(raw_actions, dict):
@@ -78,12 +87,21 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
                 if act.get("photo_url"):
                     act["photo_url"] = to_public_url(act["photo_url"])
                 actions.append(act)
-            if "share_name_with_master" in item and not r_name:
-                s_name = item.get("share_name_with_master", False)
-                if s_name:
-                    r_name = item.get("reporter_name") or resolve_crew_name(t.reporter_ref)
+            if "share_name_with_master" in item:
+                if not r_name:
+                    s_name = item.get("share_name_with_master", False)
+                    if s_name:
+                        r_name = item.get("reporter_name") or resolve_crew_name(t.reporter_ref)
+                if item.get("reporter_id"):
+                    r_id = item.get("reporter_id")
+                if item.get("description_original"):
+                    description_original = item.get("description_original")
+                if item.get("original_language"):
+                    original_language = item.get("original_language") or "en"
             if "audio_url" in item and item.get("audio_url"):
                 stored_audio_url = item.get("audio_url")
+            if item.get("reject_reason"):
+                reject_reason = item.get("reject_reason")
 
     onboard_status = t.onboard_status
     if onboard_status in ("NEW", "SUBMITTED"):
@@ -121,7 +139,7 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
             else:
                 photos.append(to_public_url(m))
 
-    return {
+    result = {
         "id": t.id,
         "ticket_id": t.id,
         "ticket_no": ticket_no,
@@ -129,16 +147,16 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
         "title_en": t.title,
         "description": t.description,
         "description_en": t.description,
-        "description_original": t.description,
-        "original_language": "en",
+        "description_original": description_original or t.description,
+        "original_language": original_language,
         "location_on_board": t.location_on_board,
-        "hazard_type": t.hazard_type,
-        "ism_category": t.ism_category,
+        "hazard_type": normalize_hazard_type(t.hazard_type),
+        "ism_category": normalize_ism_category(t.ism_category),
         "severity": t.severity,
         "immediate_action": t.immediate_action,
         "photos": photos,
         "audio_url": to_public_url(audio_url) if audio_url else None,
-        "share_name_with_master": s_name,
+        "share_name_with_master": bool(s_name),
         "reporter_name": r_name if s_name else None,
         "reporter_ref": t.reporter_ref,
         "vessel_id": t.vessel_id,
@@ -149,6 +167,11 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
         "queued_to_outbox": True,
         "message": "Report finalized and queued for satellite sync.",
     }
+    if s_name and r_id:
+        result["reporter_id"] = r_id
+    if reject_reason:
+        result["reject_reason"] = reject_reason
+    return result
 
 
 class AnswerRequest(BaseModel):
@@ -328,6 +351,8 @@ async def create_draft(
         "vessel_id": user.get("vessel_id", VESSEL_ID),
         "text": text or "",
         "language": lang,
+        "transcript_original": text or "",
+        "original_language": lang or "en",
         "audio": audio_meta,
         "audio_bytes": audio_bytes_data,
         "duration": audio_duration_val,
@@ -366,6 +391,9 @@ async def structure_draft(
 
     text = (draft.get("text") or "").strip()
 
+    # Preserve any pre-structure free text as the native transcript source.
+    native_source = (draft.get("text") or "").strip()
+
     if not text and draft.get("audio"):
         audio_info = draft["audio"]
         audio_bytes = draft.get("audio_bytes")
@@ -382,12 +410,31 @@ async def structure_draft(
             text = transcribed
             draft["text"] = transcribed
             draft["transcript_original"] = transcribed
+            native_source = transcribed
+
+    if not text and draft.get("photos"):
+        # Photo-only draft: describe hazard with local vision model (gemma3:4b)
+        photo_bytes_list: List[bytes] = []
+        for p in draft["photos"]:
+            photo_path = UPLOADS_DIR / p.get("filename", "")
+            if photo_path.exists():
+                photo_bytes_list.append(photo_path.read_bytes())
+        vision_desc = await ai_gateway.describe_hazard_photos(photo_bytes_list)
+        if vision_desc:
+            text = vision_desc
+            draft["text"] = vision_desc
+            draft["transcript_original"] = vision_desc
+            native_source = vision_desc
+        else:
+            text = "Hazard observed on board from attached photo inspection."
+            native_source = text
 
     if not text:
-        if draft.get("photos"):
-            text = "Hazard observed on board from attached photo inspection."
-        else:
-            text = "Seafarer observed equipment or environmental hazard during rounds."
+        text = "Seafarer observed equipment or environmental hazard during rounds."
+        native_source = text
+
+    if not draft.get("transcript_original"):
+        draft["transcript_original"] = native_source
 
     try:
         struct_res = await ai_gateway.structure_near_miss_report(draft_id, text, db=db)
@@ -397,14 +444,27 @@ async def structure_draft(
             detail={"error": e.message, "safety_rail_hit": True}
         )
 
-    draft["fields"] = struct_res["fields"]
+    fields = TicketFields.model_validate(struct_res["fields"])
+    draft["fields"] = fields.model_dump()
+
+    # Prefer client-provided lang when non-default; otherwise script heuristic.
+    client_lang = (draft.get("language") or "en").lower()
+    detected = struct_res.get("original_language") or ai_gateway.detect_language(
+        draft.get("transcript_original") or text
+    )
+    original_language = client_lang if client_lang and client_lang != "en" else detected
+    draft["original_language"] = original_language
+
+    cq = struct_res.get("clarifying_question")
+    if isinstance(cq, str) and not cq.strip():
+        cq = None
 
     return TicketStructureResponse(
         draft_id=draft_id,
-        original_language=draft.get("language", "en"),
+        original_language=original_language,
         transcript_original=draft.get("transcript_original") or text,
-        fields=TicketFields.model_validate(struct_res["fields"]),
-        clarifying_question=struct_res["clarifying_question"],
+        fields=fields,
+        clarifying_question=cq,
         confidence=struct_res.get("confidence", 0.95),
     )
 
@@ -435,7 +495,10 @@ def answer_clarifying_question(
             "immediate_action": "",
         }
     else:
+        fields = dict(fields)
         fields["location_on_board"] = req.answer
+    # Normalize to FE ReportFields enums
+    fields = TicketFields.model_validate(fields).model_dump()
     draft["fields"] = fields
     return fields
 
@@ -465,12 +528,13 @@ def finalize_report(
     vessel_id = user.get("vessel_id", VESSEL_ID)
     ticket_id = uuid7_str()
 
-    fields_dict = req.fields.model_dump() if req.fields else draft.get("fields", {})
-    if not fields_dict:
+    raw_fields = req.fields.model_dump() if req.fields else draft.get("fields", {})
+    if not raw_fields:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "Draft must be structured before final submission"}
         )
+    fields_dict = TicketFields.model_validate(raw_fields).model_dump()
 
     reporter_ref = generate_reporter_ref(crew_id, ticket_id)
     roster_names = [d[0] for d in db.query(DeviceModel.crew_name).filter(DeviceModel.crew_name.isnot(None)).all() if d[0]]
@@ -481,7 +545,8 @@ def finalize_report(
     scrubbed_action = scrub_pii(fields_dict.get("immediate_action", ""), roster_names=roster_names)
 
     now = get_utc_now()
-    reporter_name = (user.get("name") or resolve_crew_name(user.get("crew_id"))) if req.share_name_with_master else None
+    share = bool(req.share_name_with_master)
+    reporter_name = (user.get("name") or resolve_crew_name(user.get("crew_id"))) if share else None
 
     draft_photos = draft.get("photos", [])
     draft_audio = draft.get("audio")
@@ -492,10 +557,16 @@ def finalize_report(
     if draft_audio:
         media_refs_list.append(draft_audio)
 
+    description_original = draft.get("transcript_original") or draft.get("text") or scrubbed_desc
+    original_language = draft.get("original_language") or ai_gateway.detect_language(description_original)
+
     meta_entry = {
-        "share_name_with_master": req.share_name_with_master,
+        "share_name_with_master": share,
         "reporter_name": reporter_name,
+        "reporter_id": crew_id if share else None,
         "audio_url": draft_audio.get("url") if draft_audio else None,
+        "description_original": description_original,
+        "original_language": original_language,
     }
 
     ticket = TicketModel(
@@ -505,8 +576,8 @@ def finalize_report(
         title=scrubbed_title,
         description=scrubbed_desc,
         location_on_board=fields_dict.get("location_on_board", "Main Deck"),
-        hazard_type=fields_dict.get("hazard_type", "Operational Hazard"),
-        ism_category=fields_dict.get("ism_category", "ISM-07"),
+        hazard_type=fields_dict.get("hazard_type", "other"),
+        ism_category=fields_dict.get("ism_category", "unsafe_condition"),
         severity=fields_dict.get("severity", 3),
         immediate_action=scrubbed_action,
         onboard_status=OnboardStatus.SUBMITTED.value,
@@ -551,7 +622,12 @@ def finalize_report(
 
     REPORT_DRAFTS.pop(req.draft_id, None)
 
-    ticket_dict = ticket_to_dict(ticket, share_name=req.share_name_with_master, reporter_name=reporter_name)
+    ticket_dict = ticket_to_dict(
+        ticket,
+        share_name=share,
+        reporter_name=reporter_name,
+        reporter_id=crew_id if share else None,
+    )
 
     sse_manager.publish(
         channel=f"vessel:{vessel_id}:master",

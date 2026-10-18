@@ -2,12 +2,21 @@
 Precedent Accident & Incident Similarity Service
 Searches over existing Tickets and historical Accident Investigation Corpus:
 Sources: MAIB, IMO, USCG, BEA-MER.
-Supports pgvector cosine similarity or vector/token overlap fallback.
+Ranking: embeddinggemma cosine similarity (local Ollama) with keyword-overlap fallback.
+Corpus embeddings are computed lazily and cached in the JSON `embedding` column.
 """
 
-from typing import List, Dict, Any
+import math
+import logging
+from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from db_models import AccidentCorpusModel, TicketModel
+from services.shore_ai_service import embed_text
+
+logger = logging.getLogger("shore.similarity")
+
+# Max historical tickets embedded per request (on-the-fly, not persisted)
+MAX_TICKETS_EMBEDDED = 50
 
 ACCIDENT_SEED_DATA = [
     {
@@ -93,6 +102,63 @@ def compute_keyword_similarity(text1: str, keywords: List[str]) -> float:
     return min(1.0, matches / max(1, len(keywords)) * 2.0)
 
 
+def _cosine(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _corpus_text(item: AccidentCorpusModel) -> str:
+    return " ".join(
+        filter(None, [item.title, item.hazard_domain, item.precursor_pattern, item.key_safety_action])
+    )
+
+
+def _get_corpus_embedding(db: Session, item: AccidentCorpusModel) -> Optional[List[float]]:
+    """Returns a cached corpus embedding, computing and persisting it if missing/zeroed."""
+    emb = item.embedding
+    if isinstance(emb, list) and emb and any(v != 0.0 for v in emb):
+        return emb
+    emb = embed_text(_corpus_text(item))
+    if emb:
+        item.embedding = emb
+        db.commit()
+    return emb
+
+
+def _corpus_result(item: AccidentCorpusModel, score: float, method: str) -> Dict[str, Any]:
+    return {
+        "type": "accident_corpus",
+        "id": item.id,
+        "source": item.source,
+        "report_code": item.report_code,
+        "title": item.title,
+        "year": item.year,
+        "hazard_domain": item.hazard_domain,
+        "precursor_pattern": item.precursor_pattern,
+        "casualty_outcome": item.casualty_outcome,
+        "key_safety_action": item.key_safety_action,
+        "similarity_score": round(score, 3),
+        "method": method,
+    }
+
+
+def _ticket_result(t: TicketModel, score: float, method: str) -> Dict[str, Any]:
+    return {
+        "type": "ticket",
+        "id": t.id,
+        "vessel_id": t.vessel_id,
+        "title": t.title,
+        "hazard_type": t.hazard_type,
+        "severity": t.severity,
+        "similarity_score": round(score, 3),
+        "method": method,
+    }
+
+
 def find_similar_precedents(
     db: Session,
     query_text: str,
@@ -100,47 +166,54 @@ def find_similar_precedents(
 ) -> List[Dict[str, Any]]:
     """
     Finds precedents from accident_corpus and similar tickets.
+    Preferred: embeddinggemma cosine similarity via local Ollama.
+    Fallback: keyword overlap when embeddings are unavailable.
     """
     ensure_corpus_seeded(db)
 
-    # 1. Corpus matches
     corpus_records = db.query(AccidentCorpusModel).all()
-    results = []
+    tickets = db.query(TicketModel).order_by(TicketModel.created_at.desc()).limit(MAX_TICKETS_EMBEDDED).all()
 
+    # ── Preferred path: embeddinggemma cosine similarity ────────────────────
+    query_emb = embed_text(query_text)
+    if query_emb:
+        results: List[Dict[str, Any]] = []
+        embedded_any = False
+
+        for item in corpus_records:
+            item_emb = _get_corpus_embedding(db, item)
+            if not item_emb:
+                continue
+            embedded_any = True
+            results.append(_corpus_result(item, _cosine(query_emb, item_emb), "embeddinggemma"))
+
+        for t in tickets:
+            if not (t.title and t.description):
+                continue
+            t_emb = embed_text(f"{t.title} {t.description}")
+            if not t_emb:
+                continue
+            embedded_any = True
+            results.append(_ticket_result(t, _cosine(query_emb, t_emb), "embeddinggemma"))
+
+        if embedded_any:
+            results.sort(key=lambda x: x["similarity_score"], reverse=True)
+            return results[:limit]
+        logger.warning("Query embedded but no corpus/ticket embeddings available; using keyword fallback")
+
+    # ── Fallback path: keyword overlap ──────────────────────────────────────
+    results = []
     for item in corpus_records:
         kw = item.similarity_keywords or []
         score = compute_keyword_similarity(f"{query_text}", kw)
         if any(word in query_text.lower() for word in item.title.lower().split() if len(word) > 4):
             score = min(1.0, score + 0.35)
+        results.append(_corpus_result(item, max(0.40, score), "keyword_overlap"))
 
-        results.append({
-            "type": "accident_corpus",
-            "id": item.id,
-            "source": item.source,
-            "report_code": item.report_code,
-            "title": item.title,
-            "year": item.year,
-            "hazard_domain": item.hazard_domain,
-            "precursor_pattern": item.precursor_pattern,
-            "casualty_outcome": item.casualty_outcome,
-            "key_safety_action": item.key_safety_action,
-            "similarity_score": round(max(0.40, score), 3),
-        })
-
-    # 2. Similar historical tickets
-    tickets = db.query(TicketModel).all()
     for t in tickets:
         if t.title and t.description:
             score = 0.5 if (t.hazard_type and t.hazard_type.lower() in query_text.lower()) else 0.3
-            results.append({
-                "type": "ticket",
-                "id": t.id,
-                "vessel_id": t.vessel_id,
-                "title": t.title,
-                "hazard_type": t.hazard_type,
-                "severity": t.severity,
-                "similarity_score": round(score, 3),
-            })
+            results.append(_ticket_result(t, score, "keyword_overlap"))
 
     results.sort(key=lambda x: x["similarity_score"], reverse=True)
     return results[:limit]

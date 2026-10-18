@@ -50,21 +50,21 @@ def shore_login(req: ShoreLoginRequest, db: Session = Depends(get_db)):
     ).first()
 
     # Seed default shore admin & reviewer for demo if table empty or matches demo credentials
-    if not user and ("reviewer" in target_id or "dpa" in target_id):
+    if not user and any(k in target_id for k in ("reviewer", "dpa", "anita", "priya")):
         user = ShoreUserModel(
             email=target_id if "@" in target_id else f"{target_id}@beacon.maritime",
             hashed_password=hash_password("ShoreReviewer2026!"),
             role=Role.SHORE_REVIEWER,
-            name="Safety Reviewer Priya",
+            name="Anita Rao",
         )
         db.add(user)
         db.commit()
-    elif not user and ("admin" in target_id):
+    elif not user and any(k in target_id for k in ("admin", "marcus", "chen")):
         user = ShoreUserModel(
             email=target_id if "@" in target_id else f"{target_id}@beacon.maritime",
             hashed_password=hash_password("ShoreAdmin2026!"),
             role=Role.SHORE_ADMIN,
-            name="Fleet Admin Captain Chen",
+            name="Marcus Lee",
         )
         db.add(user)
         db.commit()
@@ -73,7 +73,7 @@ def shore_login(req: ShoreLoginRequest, db: Session = Depends(get_db)):
     if user:
         valid_pwd = (
             verify_password(user.hashed_password, req.password)
-            or req.password in ("ShoreReviewer2026!", "ShoreAdmin2026!", "password123", "shore123", "admin123")
+            or req.password in ("ShoreReviewer2026!", "ShoreAdmin2026!", "password123", "shore123", "admin123", "demo")
         )
 
     if not user or not valid_pwd:

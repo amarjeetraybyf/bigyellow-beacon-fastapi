@@ -153,6 +153,7 @@ def test_report_submission_pii_scrub_and_outbox():
     )
     assert draft_res.status_code == 201
     draft_id = draft_res.json()["draft_id"]
+    assert "draft_id" in draft_res.json()
 
     # 2. Structure draft via AI Gateway (with offline maritime fallback)
     struct_res = client.post(
@@ -160,6 +161,19 @@ def test_report_submission_pii_scrub_and_outbox():
         headers={"Authorization": f"Bearer {crew_token}"},
     )
     assert struct_res.status_code == 200
+    struct = struct_res.json()
+    assert "fields" in struct
+    assert "transcript_original" in struct
+    assert "confidence" in struct
+    fields = struct["fields"]
+    assert fields["hazard_type"] in {
+        "slip_trip_fall", "mooring", "crane_lifting", "enclosed_space",
+        "fire", "machinery", "electrical", "chemical", "other",
+    }
+    assert fields["ism_category"] in {
+        "unsafe_act", "unsafe_condition", "equipment_failure", "procedure_gap",
+    }
+    assert 1 <= fields["severity"] <= 5
 
     # 3. Finalize ticket
     finalize_res = client.post(
@@ -171,11 +185,24 @@ def test_report_submission_pii_scrub_and_outbox():
         json={
             "draft_id": draft_id,
             "share_name_with_master": False,
+            "fields": fields,
         },
     )
     assert finalize_res.status_code == 201
     data = finalize_res.json()
     assert "id" in data
+    assert "ticket_no" in data
+    assert data["title_en"]
+    assert data["onboard_status"] == "SUBMITTED"
+    assert data["shore_status"] in ("NEW", "QUEUED")
+    assert isinstance(data["photos"], list)
+    assert isinstance(data["actions"], list)
+    assert data["hazard_type"] in {
+        "slip_trip_fall", "mooring", "crane_lifting", "enclosed_space",
+        "fire", "machinery", "electrical", "chemical", "other",
+    }
+    assert "description_original" in data
+    assert "original_language" in data
 
     # Verify PII was scrubbed
     assert "mate.reyes@shipping.com" not in data["description"]
@@ -195,6 +222,44 @@ def test_report_submission_pii_scrub_and_outbox():
         assert outbox_entry.synced is False
     finally:
         db.close()
+
+
+def test_report_api_v1_draft_and_answer_location():
+    """FE hits /api/v1/reports/drafts then /reports/.../answer with full ReportFields."""
+    crew_token = create_edge_session_token(
+        crew_id="CREW-FE-001",
+        role=Role.CREW,
+        vessel_id="MV-PACIFIC-STAR",
+    )
+    draft_res = client.post(
+        "/api/v1/reports/drafts",
+        headers={"Authorization": f"Bearer {crew_token}", "Idempotency-Key": "fe-draft-1"},
+        data={"text": "Slipped on hydraulic oil near crane 2. No injury."},
+    )
+    assert draft_res.status_code == 201
+    draft_id = draft_res.json()["draft_id"]
+
+    struct_res = client.post(
+        f"/reports/drafts/{draft_id}/structure",
+        headers={"Authorization": f"Bearer {crew_token}"},
+    )
+    assert struct_res.status_code == 200
+
+    answer_res = client.post(
+        f"/reports/drafts/{draft_id}/answer",
+        headers={"Authorization": f"Bearer {crew_token}"},
+        json={"answer": "Main deck, crane 2"},
+    )
+    assert answer_res.status_code == 200
+    answered = answer_res.json()
+    assert answered["location_on_board"] == "Main deck, crane 2"
+    assert answered["hazard_type"] in {
+        "slip_trip_fall", "mooring", "crane_lifting", "enclosed_space",
+        "fire", "machinery", "electrical", "chemical", "other",
+    }
+    assert answered["ism_category"] in {
+        "unsafe_act", "unsafe_condition", "equipment_failure", "procedure_gap",
+    }
 
 
 def test_confidential_checkin_privacy():
