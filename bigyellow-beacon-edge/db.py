@@ -8,13 +8,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 
 from db_models import Base
-from config import DATABASE_URL
+from config import DATABASE_URL, BASE_DIR
 
 
 def create_edge_engine(db_url: str):
     connect_args = {}
     if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        if db_url.startswith("sqlite:///") and not db_url.startswith("sqlite:////") and db_url != "sqlite:///:memory:":
+            rel_name = db_url.replace("sqlite:///", "")
+            db_url = f"sqlite:///{BASE_DIR / rel_name}"
     elif db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
@@ -24,7 +27,7 @@ def create_edge_engine(db_url: str):
             pass
         return eng
     except Exception:
-        fallback_url = "sqlite:///edge_local.db"
+        fallback_url = f"sqlite:///{BASE_DIR / 'edge_local.db'}"
         return create_engine(fallback_url, connect_args={"check_same_thread": False}, echo=False)
 
 

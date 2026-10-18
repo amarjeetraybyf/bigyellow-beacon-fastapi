@@ -9,13 +9,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 from db_models import Base
-from config import DATABASE_URL
+from config import DATABASE_URL, BASE_DIR
 
 
 def create_shore_engine(db_url: str):
     connect_args = {}
     if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        if db_url.startswith("sqlite:///") and not db_url.startswith("sqlite:////") and db_url != "sqlite:///:memory:":
+            rel_name = db_url.replace("sqlite:///", "")
+            db_url = f"sqlite:///{BASE_DIR / rel_name}"
     elif db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
@@ -27,7 +30,7 @@ def create_shore_engine(db_url: str):
         return eng
     except Exception:
         # Fallback to local SQLite if PostgreSQL cannot connect
-        fallback_url = "sqlite:///shore_local.db"
+        fallback_url = f"sqlite:///{BASE_DIR / 'shore_local.db'}"
         return create_engine(fallback_url, connect_args={"check_same_thread": False}, echo=False)
 
 

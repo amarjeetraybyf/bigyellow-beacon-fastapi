@@ -170,13 +170,16 @@ class SyncWorker:
                 if res.status_code == 200:
                     resp_json = res.json()
                     acked = set(resp_json.get("acked_event_ids", []))
+                    rejected = set(resp_json.get("rejected_event_ids", []))
+                    if rejected:
+                        print(f"⚠️  [SyncWorker] Shore rejected {len(rejected)} event(s): {rejected}")
                     now = datetime.now(timezone.utc)
                     for item in unsynced_items:
                         if item.id in acked:
                             item.synced = True
                             item.synced_at = now
                     db.commit()
-                    return {"acked_count": len(acked), "total_attempted": len(unsynced_items)}
+                    return {"acked_count": len(acked), "rejected_count": len(rejected), "total_attempted": len(unsynced_items)}
                 else:
                     self.backoff_seconds = min(300.0, self.backoff_seconds * 2)
                     return {"error": f"Shore rejected push: {res.status_code} {res.text}"}
