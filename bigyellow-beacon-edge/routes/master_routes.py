@@ -11,11 +11,14 @@ Requires role 'master' (includes safety officer).
 - POST /master/welfare/{id}/ack
 """
 
+import base64
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query, status
+from fastapi import APIRouter, HTTPException, Depends, Query, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func
 
 from contract.enums import Role, OnboardStatus, SSEEvent
@@ -36,7 +39,9 @@ from auth import require_edge_role
 from security import hash_pin_argon2
 from services.sse_manager import sse_manager
 from services.ai_gateway import ai_gateway
-from routes.reports_routes import ticket_to_dict
+from services.pii_scrub import strip_exif
+from routes.reports_routes import ticket_to_dict, to_public_url, UPLOADS_DIR
+from routes.auth_routes import ensure_default_crew_roster
 
 router = APIRouter(prefix="/master", tags=["Master Ship Command"])
 
@@ -44,10 +49,13 @@ MASTER_BRIEF_STORE: Dict[str, Any] = {}
 
 
 class MasterActionRequest(BaseModel):
-    text: str
-    responsible_rank: str
+    text: Optional[str] = ""
+    responsible_rank: Optional[str] = "Bosun"
     due_at: Optional[Any] = None
     resolve: bool = False
+    photo_url: Optional[str] = None
+    photo: Optional[str] = None
+    photo_base64: Optional[str] = None
 
 
 class WelfareAckRequest(BaseModel):
@@ -115,34 +123,119 @@ def acknowledge_ticket(
 
 
 @router.post("/tickets/{ticket_id}/actions")
-def assign_or_resolve_action(
+async def assign_or_resolve_action(
     ticket_id: str,
-    req: MasterActionRequest,
+    request: Request,
     user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
     db: Session = Depends(get_db),
 ):
-    """Master assigns corrective action to ticket, or resolves it."""
+    """Master assigns corrective action to ticket, or resolves it with optional resolution photo."""
     ticket = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail={"error": "Ticket not found"})
 
-    due_str = str(req.due_at) if req.due_at else None
-    action_payload = {
+    content_type = request.headers.get("content-type", "")
+    text = ""
+    responsible_rank = "Bosun"
+    due_at = None
+    resolve = False
+    photo_bytes: Optional[bytes] = None
+    photo_filename = "resolution.jpg"
+    photo_url: Optional[str] = None
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        text = str(form.get("text") or "")
+        responsible_rank = str(form.get("responsible_rank") or "Bosun")
+        due_at = form.get("due_at")
+        resolve_raw = form.get("resolve")
+        if isinstance(resolve_raw, str):
+            resolve = resolve_raw.lower() in ("true", "1", "yes", "on")
+        else:
+            resolve = bool(resolve_raw)
+
+        # File upload
+        upload_item = form.get("photo") or form.get("file") or form.get("image")
+        if upload_item is not None:
+            if hasattr(upload_item, "read"):
+                photo_bytes = await upload_item.read()
+                if hasattr(upload_item, "filename") and upload_item.filename:
+                    photo_filename = upload_item.filename
+            elif isinstance(upload_item, str) and upload_item:
+                photo_url = upload_item
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        text = body.get("text", "")
+        responsible_rank = body.get("responsible_rank", "Bosun")
+        due_at = body.get("due_at")
+        resolve = bool(body.get("resolve", False))
+        photo_url = body.get("photo_url") or body.get("photo")
+        photo_base64 = body.get("photo_base64")
+        if photo_base64:
+            if "," in photo_base64:
+                photo_base64 = photo_base64.split(",", 1)[1]
+            try:
+                photo_bytes = base64.b64decode(photo_base64)
+            except Exception:
+                pass
+        elif photo_url and photo_url.startswith("data:image"):
+            try:
+                photo_bytes = base64.b64decode(photo_url.split(",", 1)[1])
+                photo_url = None
+            except Exception:
+                pass
+
+    if photo_bytes and len(photo_bytes) > 0:
+        cleaned_photo = strip_exif(photo_bytes)
+        ext = Path(photo_filename).suffix.lower() if photo_filename else ".jpg"
+        if not ext or ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+            ext = ".jpg"
+        filename = f"resolution_{ticket.id}_{uuid7_str()}{ext}"
+        filepath = UPLOADS_DIR / filename
+        filepath.write_bytes(cleaned_photo)
+        photo_url = to_public_url(f"/uploads/{filename}")
+    elif photo_url:
+        photo_url = to_public_url(photo_url)
+
+    due_str = str(due_at) if due_at else None
+    action_payload: Dict[str, Any] = {
         "id": uuid7_str(),
-        "text": req.text,
-        "responsible_rank": req.responsible_rank,
+        "text": text,
+        "responsible_rank": responsible_rank,
         "due_at": due_str,
         "assigned_at": datetime.now(timezone.utc).isoformat(),
-        "resolved": req.resolve,
+        "resolved": resolve,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if photo_url:
+        action_payload["photo_url"] = photo_url
 
-    current_actions = ticket.assigned_action or []
-    if isinstance(current_actions, dict):
-        current_actions = [current_actions]
+    current_actions = list(ticket.assigned_action or [])
+    if isinstance(ticket.assigned_action, dict):
+        current_actions = [ticket.assigned_action]
     current_actions.append(action_payload)
     ticket.assigned_action = current_actions
-    ticket.onboard_status = OnboardStatus.RESOLVED_ON_BOARD.value if req.resolve else OnboardStatus.ACTION_IN_PROGRESS.value
+    flag_modified(ticket, "assigned_action")
+
+    if photo_url:
+        current_media = list(ticket.media_refs or [])
+        current_media.append({
+            "type": "photo",
+            "url": photo_url,
+            "filename": photo_filename,
+            "tag": "resolution",
+        })
+        ticket.media_refs = current_media
+        flag_modified(ticket, "media_refs")
+
+    ticket.onboard_status = (
+        OnboardStatus.RESOLVED_ON_BOARD.value
+        if resolve
+        else OnboardStatus.ACTION_IN_PROGRESS.value
+    )
     ticket.version += 1
 
     outbox = OutboxModel(
@@ -154,6 +247,7 @@ def assign_or_resolve_action(
             "id": ticket.id,
             "onboard_status": ticket.onboard_status,
             "assigned_action": ticket.assigned_action,
+            "media_refs": ticket.media_refs,
             "version": ticket.version,
         },
         severity=ticket.severity,
@@ -161,11 +255,17 @@ def assign_or_resolve_action(
     )
     db.add(outbox)
     db.commit()
+    db.refresh(ticket)
 
     sse_manager.publish(
         channel=f"vessel:{ticket.vessel_id}:master",
         event_type=SSEEvent.TICKET_UPDATED.value,
-        data={"ticket_id": ticket.id, "onboard_status": ticket.onboard_status},
+        data={
+            "ticket_id": ticket.id,
+            "onboard_status": ticket.onboard_status,
+            "photo_url": photo_url,
+            "action": action_payload,
+        },
     )
 
     return ticket_to_dict(ticket)
@@ -383,11 +483,12 @@ def list_crew_members(
     db: Session = Depends(get_db),
 ):
     vessel_id = user.get("vessel_id", VESSEL_ID)
+    ensure_default_crew_roster(db)
     accounts = db.query(CrewAccountModel).filter(
         (CrewAccountModel.vessel_id == vessel_id) | (CrewAccountModel.vessel_id.is_(None))
-    ).order_by(CrewAccountModel.created_at.desc()).all()
+    ).order_by(CrewAccountModel.created_at.asc()).all()
 
-    results = [
+    return [
         {
             "id": a.id,
             "name": a.name,
@@ -400,20 +501,6 @@ def list_crew_members(
         }
         for a in accounts
     ]
-
-    if not any(a["username"] == "crew" for a in results):
-        results.append({
-            "id": "u-crew",
-            "name": "Arjun Nair",
-            "username": "crew",
-            "rank": "AB Seaman",
-            "rank_band": "rating",
-            "role": "crew",
-            "language": "en",
-            "created_at": "2026-10-17T00:00:00Z",
-        })
-
-    return results
 
 
 @router.post("/crew", status_code=status.HTTP_201_CREATED)

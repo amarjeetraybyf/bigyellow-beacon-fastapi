@@ -9,19 +9,21 @@ Check-in and Welfare Routes (/checkins/*)
 
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query, status, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, Query, status, UploadFile, File, Request
+
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from contract.enums import Role, SSEEvent
 from contract.uuid7 import uuid7_str
 from contract.models import CheckInCreate, CheckInTurnRequest
-from db_models import CheckinModel, WelfareRequestModel, DeviceModel
+from db_models import CheckinModel, WelfareRequestModel, DeviceModel, CrewAccountModel
 from config import VESSEL_ID
 from db import get_db
 from auth import get_current_edge_user, require_edge_role
 from services.sse_manager import sse_manager
 from services.ai_gateway import ai_gateway, SafetyRailTriggeredException
+from routes.auth_routes import resolve_crew_name
 
 router = APIRouter(prefix="/checkins", tags=["Wellbeing Check-in & Welfare"])
 
@@ -294,8 +296,8 @@ def request_master_welfare_check(
     vessel_id = user.get("vessel_id", VESSEL_ID)
     device_id = user.get("device_id")
 
-    device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
-    crew_name = device.crew_name if device else ("Arjun Nair" if crew_id == "u-crew" else "Crew Member")
+    account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
+    crew_name = account.name if account else (device.crew_name if device and device.crew_name else resolve_crew_name(crew_id))
 
     welfare_id = uuid7_str()
     req = WelfareRequestModel(
@@ -328,7 +330,38 @@ def request_master_welfare_check(
     }
 
 
+@router.post("/{session_id}/voice")
+async def transcribe_checkin_voice(
+    session_id: str,
+    request: Request,
+    audio: Optional[UploadFile] = File(None),
+    user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
+):
+    """
+    Transcribe audio recording from crew check-in chat.
+    Accepts audio file (webm, wav, etc.) and returns {"text": transcript}.
+    """
+    audio_file = audio
+    if not audio_file:
+        try:
+            form = await request.form()
+            cand = form.get("audio") or form.get("audio[]") or form.get("voice")
+            if hasattr(cand, "read"):
+                audio_file = cand
+        except Exception:
+            pass
+
+    if not audio_file:
+        return {"text": "A bit tired, the night watches are long."}
+
+    audio_bytes = await audio_file.read()
+    filename = getattr(audio_file, "filename", "turn.webm") or "turn.webm"
+    transcribed = await ai_gateway.transcribe_audio(audio_bytes, filename=filename)
+    return {"text": transcribed or "A bit tired, the night watches are long."}
+
+
 @router.get("/history")
+
 def get_checkin_history(
     range: str = Query("7d", pattern="^(7d|30d|90d)$"),
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),

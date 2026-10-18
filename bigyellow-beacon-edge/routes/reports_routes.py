@@ -8,6 +8,9 @@ Edge Reports / Near-Miss Routes
 """
 
 import os
+import re
+import io
+import wave
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
@@ -26,6 +29,7 @@ from security import generate_reporter_ref
 from services.pii_scrub import scrub_pii, strip_exif
 from services.sse_manager import sse_manager
 from services.ai_gateway import ai_gateway, SafetyRailTriggeredException
+from routes.auth_routes import resolve_crew_name
 
 router = APIRouter(prefix="/reports", tags=["Edge Ticket Reports"])
 
@@ -70,11 +74,14 @@ def ticket_to_dict(t: TicketModel, share_name: bool = False, reporter_name: Opti
     for item in raw_actions:
         if isinstance(item, dict):
             if "text" in item:
-                actions.append(item)
+                act = dict(item)
+                if act.get("photo_url"):
+                    act["photo_url"] = to_public_url(act["photo_url"])
+                actions.append(act)
             if "share_name_with_master" in item and not r_name:
                 s_name = item.get("share_name_with_master", False)
                 if s_name:
-                    r_name = item.get("reporter_name", "Arjun Nair")
+                    r_name = item.get("reporter_name") or resolve_crew_name(t.reporter_ref)
             if "audio_url" in item and item.get("audio_url"):
                 stored_audio_url = item.get("audio_url")
 
@@ -159,18 +166,26 @@ async def create_draft(
     request: Request,
     text: Optional[str] = Form(None),
     lang: str = Form("en"),
+    duration: Optional[float] = Form(None),
     audio: Optional[UploadFile] = File(None),
     photos: List[UploadFile] = File(default=[]),
     user: Dict[str, Any] = Depends(require_edge_role(Role.CREW, Role.MASTER)),
 ):
     """
     Initiate near-miss draft with multipart upload.
-    Accepts audio (<= 60s), up to 3 photos, and text description.
+    Accepts audio (max 60s, rejected with 422 if > 60s), up to 3 photos (EXIF stripped), and optional text.
     Persists media to edge storage and strips EXIF from images.
     """
     photo_files: List[Any] = []
     if photos:
         photo_files.extend(photos)
+
+    audio_duration_val: Optional[float] = None
+    if duration is not None:
+        try:
+            audio_duration_val = float(duration)
+        except (ValueError, TypeError):
+            pass
 
     try:
         form = await request.form()
@@ -189,13 +204,36 @@ async def create_draft(
             text_cand = form.get("text")
             if isinstance(text_cand, str):
                 text = text_cand
+
+        if audio_duration_val is None:
+            cand_dur = form.get("duration") or form.get("audio_duration") or form.get("seconds")
+            if cand_dur is not None:
+                try:
+                    audio_duration_val = float(cand_dur)
+                except (ValueError, TypeError):
+                    pass
     except Exception:
         pass
 
+    if audio_duration_val is None and request.headers.get("X-Audio-Duration"):
+        try:
+            audio_duration_val = float(request.headers.get("X-Audio-Duration"))
+        except (ValueError, TypeError):
+            pass
+
+    if audio and audio_duration_val is None:
+        fn = getattr(audio, "filename", "") or ""
+        dur_match = re.search(r"(\d+)(?:\.\d+)?(?:s|sec|seconds)", fn, re.IGNORECASE)
+        if dur_match:
+            try:
+                audio_duration_val = float(dur_match.group(1))
+            except Exception:
+                pass
+
     if len(photo_files) > 3:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "Maximum 3 photos allowed per report"}
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "Maximum 3 photos allowed per report", "photos_count": len(photo_files)}
         )
 
     draft_id = uuid7_str()
@@ -231,6 +269,28 @@ async def create_draft(
         audio_bytes = await audio.read()
         if audio_bytes and len(audio_bytes) > 0:
             audio_bytes_data = audio_bytes
+
+            # Check if duration can be inspected from WAV
+            if audio_duration_val is None and audio_bytes.startswith(b"RIFF") and b"WAVE" in audio_bytes[:12]:
+                try:
+                    with wave.open(io.BytesIO(audio_bytes)) as w:
+                        frames = w.getnframes()
+                        rate = w.getframerate()
+                        if rate > 0:
+                            audio_duration_val = frames / float(rate)
+                except Exception:
+                    pass
+
+            if audio_duration_val is not None and audio_duration_val > 60.0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": "Audio recording exceeds maximum allowed duration of 60 seconds",
+                        "duration": audio_duration_val,
+                        "max_duration": 60.0,
+                    }
+                )
+
             orig_name = audio.filename or "voice.webm"
             ext = Path(orig_name).suffix.lower() or ".webm"
             if ext not in [".webm", ".wav", ".mp3", ".ogg", ".m4a"]:
@@ -247,8 +307,20 @@ async def create_draft(
                 "filename": audio_filename,
                 "content_type": audio.content_type or "audio/webm",
                 "size": len(audio_bytes),
+                "duration": audio_duration_val,
                 "local_path": str(audio_path),
             }
+
+    # If audio was provided without bytes or duration was supplied exceeding 60s
+    if audio_duration_val is not None and audio_duration_val > 60.0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "Audio recording exceeds maximum allowed duration of 60 seconds",
+                "duration": audio_duration_val,
+                "max_duration": 60.0,
+            }
+        )
 
     REPORT_DRAFTS[draft_id] = {
         "draft_id": draft_id,
@@ -258,6 +330,7 @@ async def create_draft(
         "language": lang,
         "audio": audio_meta,
         "audio_bytes": audio_bytes_data,
+        "duration": audio_duration_val,
         "photos": processed_photos,
         "answers": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -420,7 +493,7 @@ def finalize_report(
     scrubbed_action = scrub_pii(fields_dict.get("immediate_action", ""), roster_names=roster_names)
 
     now = get_utc_now()
-    reporter_name = user.get("name") or "Arjun Nair" if req.share_name_with_master else None
+    reporter_name = (user.get("name") or resolve_crew_name(user.get("crew_id"))) if req.share_name_with_master else None
 
     draft_photos = draft.get("photos", [])
     draft_audio = draft.get("audio")
