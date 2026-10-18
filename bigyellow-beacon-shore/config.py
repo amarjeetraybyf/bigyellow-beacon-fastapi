@@ -40,6 +40,13 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 
+# Imagen cover art for microlearnings (Vertex AI; hybrid soft-timeout on /learnings/draft)
+IMAGEN_MODEL = os.getenv("IMAGEN_MODEL", "imagen-3.0-generate-002")
+IMAGEN_ENABLED = os.getenv("IMAGEN_ENABLED", "true").lower() in ("true", "1", "yes")
+# Soft wait inside draft; if exceeded, return pending and finish in background
+IMAGEN_DRAFT_WAIT_SECONDS = float(os.getenv("IMAGEN_DRAFT_WAIT_SECONDS", "8"))
+MEDIA_DIR = Path(os.getenv("SHORE_MEDIA_DIR", str(BASE_DIR / "media")))
+
 # Reverse Proxy / Gateway subpath prefix (e.g. "/shore" if hosted behind API gateway)
 ROOT_PATH = os.getenv("ROOT_PATH", os.getenv("SHORE_ROOT_PATH", ""))
 

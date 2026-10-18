@@ -68,13 +68,25 @@ ollama pull embeddinggemma   # precedent similarity search
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Vertex region |
 | `GEMINI_API_KEY` | (empty) | Enables AI Studio fallback |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Cloud model name |
+| `IMAGEN_ENABLED` | `true` | Generate microlearning cover art on draft |
+| `IMAGEN_MODEL` | `imagen-3.0-generate-002` | Vertex Imagen model (professional, no-text prompt) |
+| `IMAGEN_DRAFT_WAIT_SECONDS` | `8` | Soft wait in `/learnings/draft`; then `image_status=pending` |
+| `SHORE_MEDIA_DIR` | `./media` | Saved cover images served at `/media/...` |
+
+### Microlearning cover images (hybrid)
+`POST /learnings/draft` drafts text and starts Imagen in parallel:
+- If the image finishes within the soft wait → `image_status: "ready"` + `media` / `image_url`
+- If slow → text returns immediately with `image_status: "pending"`; poll `GET /learnings/{id}` until `ready`
+- If Vertex/Imagen unavailable → `image_status: "unavailable"` (text draft still OK)
+
+Images are professional training illustrations (no text, charts, or graphs in the prompt).
 
 ### Smoke checks
 ```bash
 # 1. Ticket analysis: POST /tickets/{id}/analysis
 #    -> "model" should be "ollama/gemma3n:e4b" (or vertex/gemini), not "deterministic-fallback"
 # 2. Learning draft: POST /learnings/draft {"topic": "Mooring safety"}
-#    -> "generated_by_model" shows the live backend
+#    -> "generated_by_model" shows the live backend; check image_status / media
 # 3. Anchor week: POST /anchor/draft-week -> 7 unique LLM-written cards
 # 4. Similarity: GET /tickets/{id}/similar -> results include "method": "embeddinggemma"
 ```

@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from config import PORT, HOST, DEBUG, ROOT_PATH
+from config import PORT, HOST, DEBUG, ROOT_PATH, MEDIA_DIR
 from db import init_shore_db
 from logging_config import logger, RequestLoggingMiddleware
 from routes.auth_routes import router as auth_router
@@ -22,10 +23,12 @@ from routes.sync_routes import router as sync_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_shore_db()
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("================================================================")
     logger.info("🏢 BigYellow Beacon Shore Server Running (Cloud Run)")
     logger.info(f"📡 Port: http://{HOST}:{PORT}")
     logger.info(f"📖 Swagger Docs: http://{HOST}:{PORT}{ROOT_PATH}/docs")
+    logger.info(f"🖼️  Media dir: {MEDIA_DIR}")
     logger.info("================================================================")
     yield
 
@@ -68,6 +71,10 @@ app.add_middleware(
 for r in (auth_router, tickets_router, learnings_router, fleet_router, sync_router):
     app.include_router(r)
     app.include_router(r, prefix="/api/v1")
+
+# Learning cover art + uploaded media (Imagen / multipart)
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
 @app.get("/shore/docs", include_in_schema=False)

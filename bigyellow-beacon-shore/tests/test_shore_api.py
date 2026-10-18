@@ -114,7 +114,11 @@ def test_video_longer_than_6s_rejected():
         headers={"Authorization": f"Bearer {token}"},
     )
     assert draft_res.status_code == 200
-    learning_id = draft_res.json()["id"]
+    draft_body = draft_res.json()
+    learning_id = draft_body["id"]
+    assert "image_status" in draft_body
+    assert draft_body["image_status"] in ("none", "pending", "ready", "unavailable")
+    assert "media" in draft_body
 
     # 2. Upload video exceeding 6.0s (e.g. 7.5s) -> Must return 400
     files = {"file": ("demo.mp4", b"fake-video-bytes", "video/mp4")}
@@ -127,6 +131,37 @@ def test_video_longer_than_6s_rejected():
     )
     assert media_res.status_code == 400
     assert "exceeds maximum allowed 6.0s" in media_res.json()["error"]
+
+
+def test_learning_draft_attaches_imagen_cover(monkeypatch):
+    """Hybrid draft includes cover when Imagen returns within soft wait."""
+    import routes.learnings_routes as learnings_routes
+
+    monkeypatch.setattr(learnings_routes, "IMAGEN_ENABLED", True)
+
+    def _fake_imagen(topic, title, situation=None):
+        return {
+            "ok": True,
+            "image_bytes": b"\xff\xd8\xfffakejpeg",
+            "mime_type": "image/jpeg",
+            "model": "vertex/imagen-3.0-generate-002",
+        }
+
+    monkeypatch.setattr(learnings_routes, "generate_learning_image", _fake_imagen)
+
+    token = get_auth_token(Role.SHORE_ADMIN.value)
+    draft_res = client.post(
+        "/learnings/draft",
+        json={"topic": "Mooring snap-back awareness"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert draft_res.status_code == 200
+    body = draft_res.json()
+    assert body["image_status"] == "ready"
+    assert body["image_url"]
+    assert body["image_url"].startswith("/media/")
+    assert len(body["media"]) >= 1
+    assert body["media"][0]["kind"] == "image"
 
 
 def test_sync_push_hmac_and_deduplication():

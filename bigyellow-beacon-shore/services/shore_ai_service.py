@@ -31,6 +31,8 @@ from config import (
     GEMINI_MODEL,
     GOOGLE_CLOUD_PROJECT,
     GOOGLE_CLOUD_LOCATION,
+    IMAGEN_MODEL,
+    IMAGEN_ENABLED,
 )
 
 logger = logging.getLogger("shore.ai_service")
@@ -316,6 +318,106 @@ Return ONLY valid JSON matching this schema exactly:
         "model": "deterministic-fallback",
         "generated_at": now_iso,
     }
+
+
+# ---------------------------------------------------------------------------
+# Microlearning cover image (Imagen on Vertex)
+# ---------------------------------------------------------------------------
+
+def build_learning_image_prompt(
+    topic: str,
+    title: str,
+    situation: Optional[str] = None,
+) -> str:
+    """
+    Professional maritime training illustration prompt.
+    Explicitly forbids text, charts, graphs, and labeled diagrams.
+    """
+    scene = (situation or "").strip()
+    scene_bit = f" Scene context: {scene[:220]}." if scene else ""
+    return (
+        f"Professional maritime safety training cover illustration for seafarers. "
+        f"Topic: {topic or 'shipboard safety'}. Title theme: {title or topic}.{scene_bit} "
+        "Photorealistic or high-end editorial style, clean composition, calm professional lighting, "
+        "shipboard / deck / engine-room atmosphere as appropriate, suitable for fleet LMS materials. "
+        "Show the hazard or safe working practice visually only. "
+        "Strict rules: NO text, NO letters, NO numbers, NO captions, NO titles, NO logos, "
+        "NO watermarks, NO charts, NO graphs, NO tables, NO labeled diagrams, NO UI overlays, "
+        "NO speech bubbles, NO icons with words. Pure visual illustration only."
+    )
+
+
+def generate_learning_image(
+    topic: str,
+    title: str,
+    situation: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Generate a cover image with Imagen on Vertex AI.
+    Returns {ok, image_bytes, mime_type, model, error?}.
+    Never raises — callers treat failure as pending/unavailable.
+    """
+    if not IMAGEN_ENABLED:
+        return {"ok": False, "error": "imagen_disabled", "model": None, "image_bytes": None}
+    if not GOOGLE_CLOUD_PROJECT:
+        return {
+            "ok": False,
+            "error": "imagen_requires_vertex_project",
+            "model": None,
+            "image_bytes": None,
+        }
+
+    prompt = build_learning_image_prompt(topic=topic, title=title, situation=situation)
+    try:
+        from google.genai import types
+
+        client = _gemini_client()
+        # Imagen is Vertex-only; prefer project client even if API key also set
+        if not GOOGLE_CLOUD_PROJECT:
+            return {"ok": False, "error": "imagen_requires_vertex_project", "model": None, "image_bytes": None}
+
+        config_kwargs: Dict[str, Any] = {
+            "number_of_images": 1,
+            "aspect_ratio": "16:9",
+            "output_mime_type": "image/jpeg",
+        }
+        # Soft-disable people faces when possible (safer for anonymized training art)
+        try:
+            config_kwargs["person_generation"] = types.PersonGeneration.DONT_ALLOW
+        except Exception:
+            pass
+
+        response = client.models.generate_images(
+            model=IMAGEN_MODEL,
+            prompt=prompt,
+            config=types.GenerateImagesConfig(**config_kwargs),
+        )
+        generated = getattr(response, "generated_images", None) or []
+        if not generated:
+            return {"ok": False, "error": "imagen_empty", "model": IMAGEN_MODEL, "image_bytes": None}
+
+        img_obj = generated[0].image
+        image_bytes = getattr(img_obj, "image_bytes", None)
+        if not image_bytes and hasattr(img_obj, "save"):
+            # Some SDK versions expose PIL-like save only
+            import io as _io
+
+            buf = _io.BytesIO()
+            img_obj.save(buf)
+            image_bytes = buf.getvalue()
+        if not image_bytes:
+            return {"ok": False, "error": "imagen_no_bytes", "model": IMAGEN_MODEL, "image_bytes": None}
+
+        return {
+            "ok": True,
+            "image_bytes": image_bytes,
+            "mime_type": "image/jpeg",
+            "model": f"vertex/{IMAGEN_MODEL}",
+            "prompt": prompt,
+        }
+    except Exception as e:
+        logger.error("Imagen generation failed: %s", e)
+        return {"ok": False, "error": str(e), "model": IMAGEN_MODEL, "image_bytes": None}
 
 
 # ---------------------------------------------------------------------------

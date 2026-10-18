@@ -22,11 +22,16 @@ Endpoints:
 
 import io
 import json
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, status, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from contract.enums import Role, LearningStatus, PullChangeType
 from contract.uuid7 import uuid7_str
@@ -37,9 +42,13 @@ from db_models import (
     ShoreAuditLogModel,
     TicketModel,
 )
-from db import get_db
+from db import get_db, SessionLocal
+from config import MEDIA_DIR, IMAGEN_DRAFT_WAIT_SECONDS, IMAGEN_ENABLED
 from security import require_shore_role
-from services.shore_ai_service import generate_learning_draft
+from services.shore_ai_service import generate_learning_draft, generate_learning_image
+
+logger = logging.getLogger("shore.learnings")
+_image_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="learning-imagen")
 
 router = APIRouter(
     tags=["Shore Learnings & Daily Anchor Management"],
@@ -49,6 +58,116 @@ router = APIRouter(
 
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _ensure_media_dir() -> Path:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    return MEDIA_DIR
+
+
+def _save_learning_image_bytes(image_bytes: bytes, mime_type: str = "image/jpeg") -> Dict[str, Any]:
+    """Persist generated cover image and return a Studio media item."""
+    media_id = uuid7_str()
+    ext = "jpg" if "jpeg" in (mime_type or "") else "png"
+    filename = f"{media_id}.{ext}"
+    path = _ensure_media_dir() / filename
+    path.write_bytes(image_bytes)
+    return {
+        "id": media_id,
+        "kind": "image",
+        "url": f"/media/{filename}",
+        "duration_s": None,
+        "bytes": len(image_bytes),
+        "primary": True,
+        "media_id": media_id,
+        "filename": filename,
+        "content_type": mime_type or "image/jpeg",
+        "source": "imagen",
+    }
+
+
+def _attach_media_to_learning(
+    learning_id: str,
+    media_item: Dict[str, Any],
+    *,
+    image_status: str,
+    image_model: Optional[str] = None,
+) -> None:
+    """Background-safe DB update for generated cover art."""
+    db = SessionLocal()
+    try:
+        learning = db.query(LearningModel).filter(LearningModel.id == learning_id).first()
+        if not learning:
+            return
+        current_media = list(learning.media) if learning.media else []
+        # Replace prior Imagen primary cover if present
+        current_media = [m for m in current_media if not (m.get("source") == "imagen" and m.get("primary"))]
+        current_media.insert(0, media_item)
+        learning.media = current_media
+        flag_modified(learning, "media")
+
+        extra = learning.target_vessel_ids if isinstance(learning.target_vessel_ids, dict) else {}
+        extra = dict(extra)
+        extra["image_status"] = image_status
+        if image_model:
+            extra["image_generated_by_model"] = image_model
+        learning.target_vessel_ids = extra
+        flag_modified(learning, "target_vessel_ids")
+        db.commit()
+    except Exception as e:
+        logger.error("Failed to attach learning image for %s: %s", learning_id, e)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _mark_learning_image_status(learning_id: str, image_status: str, error: Optional[str] = None) -> None:
+    db = SessionLocal()
+    try:
+        learning = db.query(LearningModel).filter(LearningModel.id == learning_id).first()
+        if not learning:
+            return
+        extra = learning.target_vessel_ids if isinstance(learning.target_vessel_ids, dict) else {}
+        extra = dict(extra)
+        extra["image_status"] = image_status
+        if error:
+            extra["image_error"] = error[:240]
+        learning.target_vessel_ids = extra
+        flag_modified(learning, "target_vessel_ids")
+        db.commit()
+    except Exception as e:
+        logger.error("Failed to mark image status for %s: %s", learning_id, e)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _run_learning_image_job(
+    learning_id: str,
+    topic: str,
+    title: str,
+    situation: str,
+) -> None:
+    """Complete cover generation after draft soft-timeout (or sync path)."""
+    result = generate_learning_image(topic=topic, title=title, situation=situation)
+    if not result.get("ok") or not result.get("image_bytes"):
+        _mark_learning_image_status(
+            learning_id,
+            "unavailable",
+            error=result.get("error") or "imagen_failed",
+        )
+        return
+    media_item = _save_learning_image_bytes(
+        result["image_bytes"],
+        result.get("mime_type") or "image/jpeg",
+    )
+    media_item["generated_by_model"] = result.get("model")
+    _attach_media_to_learning(
+        learning_id,
+        media_item,
+        image_status="ready",
+        image_model=result.get("model"),
+    )
 
 
 # ─── PYDANTIC REQUEST SCHEMAS ────────────────────────────────────────────────
@@ -195,6 +314,13 @@ def serialize_shore_learning(learning: LearningModel) -> Dict[str, Any]:
         learning.updated_at.isoformat() if learning.status == LearningStatus.PUBLISHED.value and learning.updated_at else None
     )
 
+    media = list(learning.media) if learning.media else []
+    primary = next((m for m in media if m.get("primary")), media[0] if media else None)
+    image_url = (primary or {}).get("url") if primary else None
+    image_status = extra.get("image_status")
+    if not image_status:
+        image_status = "ready" if image_url else "none"
+
     res = {
         "id": learning.id,
         "source_ticket_id": extra.get("source_ticket_id"),
@@ -210,7 +336,10 @@ def serialize_shore_learning(learning: LearningModel) -> Dict[str, Any]:
         "rank_filter": extra.get("rank_filter", "all"),
         "priority": priority,
         "status": (learning.status or "draft").lower(),
-        "media": learning.media or [],
+        "media": media,
+        "image_url": image_url,
+        "image_status": image_status,  # none | pending | ready | unavailable
+        "image_generated_by_model": extra.get("image_generated_by_model"),
         "tags": tags,
         "ai_drafted_fields": extra.get("ai_drafted_fields", []),
         "stats": stats,
@@ -400,7 +529,13 @@ def update_shore_learning(
 def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_db)):
     """
     Draft microlearning using shore AI (Ollama first, Vertex/Gemini fallback).
-    Returns Studio-shaped learning object. Never sends reporter_ref / crew PII.
+
+    Hybrid cover image:
+    - Starts Imagen in parallel with text draft.
+    - Soft-waits IMAGEN_DRAFT_WAIT_SECONDS; if ready, returns media + image_status=ready.
+    - If slow/unavailable, returns text immediately with image_status=pending|unavailable;
+      FE polls GET /learnings/{id} until ready.
+    Never sends reporter_ref / crew PII.
     """
     ticket = None
     if req.ticket_id:
@@ -455,6 +590,16 @@ def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_
             "answer_index": 0,
         }
 
+    # Kick Imagen early (parallel with text draft) using topic + incident context
+    image_future = None
+    if IMAGEN_ENABLED:
+        image_future = _image_executor.submit(
+            generate_learning_image,
+            topic,
+            topic,
+            incident_context,
+        )
+
     draft = generate_learning_draft(
         topic=topic,
         incident_context=incident_context,
@@ -468,6 +613,34 @@ def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_
     if isinstance(suggested, list) and suggested:
         do_points = [str(x) for x in suggested[:3]] + do_points
         do_points = do_points[:3]
+
+    media: List[Dict[str, Any]] = []
+    image_status = "none"
+    image_model = None
+    defer_image_future = None
+
+    if image_future is not None:
+        try:
+            result = image_future.result(timeout=IMAGEN_DRAFT_WAIT_SECONDS)
+            if result.get("ok") and result.get("image_bytes"):
+                media_item = _save_learning_image_bytes(
+                    result["image_bytes"],
+                    result.get("mime_type") or "image/jpeg",
+                )
+                media_item["generated_by_model"] = result.get("model")
+                media = [media_item]
+                image_status = "ready"
+                image_model = result.get("model")
+            else:
+                image_status = "unavailable"
+                image_model = result.get("model")
+        except FuturesTimeoutError:
+            # Soft-timeout: return text now; same future finishes in background after commit
+            image_status = "pending"
+            defer_image_future = image_future
+        except Exception as e:
+            logger.warning("Learning image soft-wait failed: %s", e)
+            image_status = "unavailable"
 
     extra = {
         "context": context,
@@ -490,6 +663,9 @@ def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_
             "check_correct": 0,
         },
         "generated_by_model": draft.get("model", "deterministic-fallback"),
+        "image_status": image_status,
+        "image_generated_by_model": image_model,
+        "source_ticket_id": req.ticket_id,
     }
 
     learning = LearningModel(
@@ -498,12 +674,46 @@ def draft_learning_with_ai(req: LearningDraftRequest, db: Session = Depends(get_
         summary=context[:250],
         body=situation,
         status=LearningStatus.DRAFT.value,
+        media=media,
         target_vessel_ids=extra,
         origin="shore",
     )
     db.add(learning)
     db.commit()
     db.refresh(learning)
+
+    if defer_image_future is not None:
+        def _finish_deferred(fut, lid: str):
+            try:
+                result = fut.result()  # wait for remaining Imagen work
+                if result.get("ok") and result.get("image_bytes"):
+                    media_item = _save_learning_image_bytes(
+                        result["image_bytes"],
+                        result.get("mime_type") or "image/jpeg",
+                    )
+                    media_item["generated_by_model"] = result.get("model")
+                    _attach_media_to_learning(
+                        lid,
+                        media_item,
+                        image_status="ready",
+                        image_model=result.get("model"),
+                    )
+                else:
+                    _mark_learning_image_status(
+                        lid,
+                        "unavailable",
+                        error=result.get("error") or "imagen_failed",
+                    )
+            except Exception as e:
+                logger.error("Deferred learning image failed for %s: %s", lid, e)
+                _mark_learning_image_status(lid, "unavailable", error=str(e))
+
+        threading.Thread(
+            target=_finish_deferred,
+            args=(defer_image_future, draft_id),
+            daemon=True,
+            name=f"learning-imagen-{draft_id[:8]}",
+        ).start()
 
     return serialize_shore_learning(learning)
 
@@ -543,7 +753,18 @@ async def upload_learning_media(
     bytes_count = meta_dict.get("bytes") or len(file_bytes) or 1024
     media_id = uuid7_str()
     kind = meta_dict.get("kind") or ("video" if "video" in content_type else "image")
-    url = f"/media/{media_id}.webp" if kind == "image" else f"/media/{media_id}.mp4"
+    ext = "webp" if kind == "image" else "mp4"
+    if kind == "image" and "jpeg" in content_type:
+        ext = "jpg"
+    elif kind == "image" and "png" in content_type:
+        ext = "png"
+    filename = f"{media_id}.{ext}"
+    url = f"/media/{filename}"
+    try:
+        path = _ensure_media_dir() / filename
+        path.write_bytes(file_bytes)
+    except Exception as e:
+        logger.warning("Could not persist uploaded media to disk: %s", e)
 
     media_item = {
         "id": media_id,
@@ -554,8 +775,8 @@ async def upload_learning_media(
         "primary": meta_dict.get("primary", True),
         # Backwards compatibility
         "media_id": media_id,
-        "filename": file.filename,
-        "content_type": "image/webp" if kind == "image" else "video/mp4",
+        "filename": file.filename or filename,
+        "content_type": content_type or ("image/webp" if kind == "image" else "video/mp4"),
     }
 
     if learning_id != "pending":
