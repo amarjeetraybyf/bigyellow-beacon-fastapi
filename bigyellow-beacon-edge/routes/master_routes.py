@@ -30,6 +30,7 @@ from db_models import (
     WelfareRequestModel,
     LearningModel,
     CheckinAggregateModel,
+    CheckinModel,
     DeviceModel,
     CrewAccountModel,
 )
@@ -271,54 +272,175 @@ async def assign_or_resolve_action(
     return ticket_to_dict(ticket)
 
 
-async def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
-    open_tickets = db.query(TicketModel).filter(
-        TicketModel.vessel_id == vessel_id,
-        TicketModel.onboard_status != OnboardStatus.RESOLVED_ON_BOARD.value,
-        TicketModel.onboard_status != OnboardStatus.RESOLVED.value,
-    ).all()
+# FE Morning Brief: hide mood chart until at least 5 check-ins in the window
+MIN_CREW_FOR_MOOD_TREND = 5
+MOOD_TREND_DAYS = 7
 
-    now = datetime.now(timezone.utc)
-    brief = {
-        "brief": "06:00 UTC Daily Master Brief",
-        "vessel_id": vessel_id,
-        "brief_time": "06:00 UTC",
-        "generated_at": now.isoformat(),
-        "headline": "Steady night. One high-severity hazard still open on deck." if open_tickets else "Quiet watch overnight. All safety parameters normal.",
-        "rest_hours_risk": {
-            "level": "medium" if len(open_tickets) > 2 else "low",
-            "note": "2 crew are close to the 10-hour rest limit after cargo ops." if len(open_tickets) > 2 else "All crew watch rotations within MLC rest hour compliance.",
-        },
-        "mood_trend": {
-            "n": 6,
-            "points": [
-                {"date": (now - timedelta(days=6-i)).strftime("%m-%d"), "mood": round(3.4 + (i % 3) * 0.3, 1)}
-                for i in range(7)
-            ]
-        },
-        "open_hazards": [
-            {
-                "ticket_no": f"BCN-{t.vessel_id[:4]}-0{str(i+35).zfill(2)}",
-                "title": t.title,
-                "severity": t.severity,
-            }
-            for i, t in enumerate(open_tickets[:4])
-        ],
-        "recommended_action": "Hold a 5-minute toolbox talk on hydraulic leaks before deck work.",
-        "fleet_context": "3 sister vessels reported crane hydraulic leaks in the last 30 days.",
-        "updated_at": now.isoformat(),
+
+def _ticket_no(t: TicketModel) -> str:
+    num_part = "".join(filter(str.isdigit, t.id or ""))[:4] or "0101"
+    vessel = (t.vessel_id or VESSEL_ID)[:4]
+    return f"BCN-{vessel}-{num_part.zfill(4)}"
+
+
+def _build_mood_trend(vessel_id: str, db: Session, now: datetime) -> Optional[Dict[str, Any]]:
+    """
+    Ship-average mood only (never individual crew).
+    Returns null when fewer than MIN_CREW_FOR_MOOD_TREND check-ins in the window.
+    Dates formatted as MM-DD for the FE chart.
+    """
+    start = (now - timedelta(days=MOOD_TREND_DAYS - 1)).strftime("%Y-%m-%d")
+    rows = (
+        db.query(CheckinModel)
+        .filter(
+            CheckinModel.vessel_id == vessel_id,
+            CheckinModel.ship_date >= start,
+        )
+        .all()
+    )
+    n = len(rows)
+    if n < MIN_CREW_FOR_MOOD_TREND:
+        # Prefer department aggregates (already k>=5) when raw check-ins are sparse
+        aggs = (
+            db.query(CheckinAggregateModel)
+            .filter(
+                CheckinAggregateModel.vessel_id == vessel_id,
+                CheckinAggregateModel.ship_date >= start,
+                CheckinAggregateModel.count >= MIN_CREW_FOR_MOOD_TREND,
+            )
+            .all()
+        )
+        if not aggs:
+            return None
+        by_date: Dict[str, List[float]] = {}
+        total_n = 0
+        for a in aggs:
+            by_date.setdefault(a.ship_date, []).append(float(a.avg_mood))
+            total_n += int(a.count or 0)
+        if total_n < MIN_CREW_FOR_MOOD_TREND:
+            return None
+        points = []
+        for day in sorted(by_date.keys()):
+            vals = by_date[day]
+            avg = sum(vals) / len(vals)
+            try:
+                mmdd = datetime.strptime(day, "%Y-%m-%d").strftime("%m-%d")
+            except ValueError:
+                mmdd = day[-5:] if len(day) >= 5 else day
+            points.append({"date": mmdd, "mood": round(avg, 1)})
+        return {"n": total_n, "points": points}
+
+    by_date: Dict[str, List[int]] = {}
+    for r in rows:
+        by_date.setdefault(r.ship_date, []).append(int(r.mood))
+    points = []
+    for day in sorted(by_date.keys()):
+        vals = by_date[day]
+        avg = sum(vals) / len(vals)
+        try:
+            mmdd = datetime.strptime(day, "%Y-%m-%d").strftime("%m-%d")
+        except ValueError:
+            mmdd = day[-5:] if len(day) >= 5 else day
+        points.append({"date": mmdd, "mood": round(avg, 1)})
+    return {"n": n, "points": points}
+
+
+def _rest_hours_risk(open_tickets: List[TicketModel], mood_trend: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Honest heuristic until dedicated rest/watch data is available."""
+    high_sev = sum(1 for t in open_tickets if (t.severity or 0) >= 4)
+    mood_low = False
+    if mood_trend and mood_trend.get("points"):
+        recent = mood_trend["points"][-1]["mood"]
+        mood_low = recent < 3.0
+
+    if high_sev >= 2 or (high_sev >= 1 and mood_low):
+        return {
+            "level": "high",
+            "note": "Multiple high-severity open hazards with elevated fatigue signals — protect rest before critical ops.",
+        }
+    if len(open_tickets) > 2 or mood_low:
+        return {
+            "level": "medium",
+            "note": "Watch rotations may be stretched after recent ops; monitor crew close to rest limits.",
+        }
+    return {
+        "level": "low",
+        "note": "No crew near rest limits right now.",
     }
 
-    # Enrich narrative sections with the local Ollama model (gemma3n:e4b).
-    # Anonymized hazard data only - no crew names, ranks, or sentiments.
+
+async def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
+    """
+    Build Master MorningBrief matching FE contract exactly for core keys.
+    Privacy: ship-average mood only; no individual check-in content.
+    """
+    open_tickets = (
+        db.query(TicketModel)
+        .filter(
+            TicketModel.vessel_id == vessel_id,
+            TicketModel.onboard_status != OnboardStatus.RESOLVED_ON_BOARD.value,
+            TicketModel.onboard_status != OnboardStatus.RESOLVED.value,
+            TicketModel.onboard_status != OnboardStatus.CLOSED.value,
+        )
+        .all()
+    )
+    open_tickets = sorted(open_tickets, key=lambda t: (t.severity or 0), reverse=True)
+
+    now = datetime.now(timezone.utc)
+    mood_trend = _build_mood_trend(vessel_id, db, now)
+    rest = _rest_hours_risk(open_tickets, mood_trend)
+
+    open_hazards = [
+        {
+            "ticket_no": _ticket_no(t),
+            "title": t.title,
+            "severity": int(t.severity or 3),
+        }
+        for t in open_tickets[:5]
+    ]
+
+    if not open_tickets:
+        headline = "Quiet watch overnight. Steady start — review yesterday's actions before deck work."
+        recommended_action = "Walk the main deck and confirm yesterday's actions are closed out."
+        fleet_context = "No fleet signals today."
+    else:
+        top = open_tickets[0]
+        headline = (
+            f"Focus today on severity-{top.severity} hazard: {top.title}. "
+            f"{len(open_tickets)} open near-miss item(s) on the board."
+        )
+        recommended_action = (
+            f"Hold a short toolbox talk on {top.hazard_type or 'the top hazard'} "
+            f"before work near {top.location_on_board or 'the reported area'}."
+        )
+        fleet_context = (
+            "Review sister-vessel learnings for similar hazards when satellite is up."
+        )
+
+    brief: Dict[str, Any] = {
+        "generated_at": now.isoformat(),
+        "headline": headline,
+        "rest_hours_risk": rest,
+        "mood_trend": mood_trend,
+        "open_hazards": open_hazards,
+        "recommended_action": recommended_action,
+        "fleet_context": fleet_context,
+    }
+
+    # Enrich narrative with local Ollama (anonymized hazard data only — no crew names).
     hazard_summary_lines = [
         f"- severity {t.severity}: {t.title} ({t.hazard_type}, {t.location_on_board}, status {t.onboard_status})"
         for t in open_tickets[:10]
     ]
+    mood_note = (
+        f"Ship-average mood trend available from {mood_trend['n']} check-ins (no individuals)."
+        if mood_trend
+        else "Not enough check-ins for a mood trend (need at least 5)."
+    )
     hazard_summary = (
-        f"Open near-miss hazards on board ({len(open_tickets)} total):\n" + "\n".join(hazard_summary_lines)
-        if hazard_summary_lines
-        else "No open near-miss hazards on board. Quiet watch overnight."
+        f"Open near-miss hazards on board ({len(open_tickets)} total):\n"
+        + ("\n".join(hazard_summary_lines) if hazard_summary_lines else "None open.")
+        + f"\nRest-hours risk: {rest['level']} — {rest['note']}\n{mood_note}"
     )
     ai_brief = await ai_gateway.generate_master_brief(hazard_summary)
     if ai_brief:
@@ -338,7 +460,7 @@ async def get_master_brief(
     user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
     db: Session = Depends(get_db),
 ):
-    """Retrieve 06:00 Daily Briefing for Master's morning meeting."""
+    """GET MorningBrief — generate on the fly if none cached."""
     vessel_id = user.get("vessel_id", VESSEL_ID)
     brief = MASTER_BRIEF_STORE.get(vessel_id)
     if not brief:
@@ -352,17 +474,22 @@ async def regenerate_master_brief(
     user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
     db: Session = Depends(get_db),
 ):
-    """Rebuild Master's 06:00 brief using current shipboard tickets and aggregates."""
+    """POST MorningBrief — fresh AI rewrite against current tickets/check-ins."""
     vessel_id = user.get("vessel_id", VESSEL_ID)
     brief = await build_morning_brief(vessel_id, db)
-    if not brief.get("generated_by_model"):
-        brief["headline"] = "Focus today on mooring gear and hydraulic inspections before arrival."
+    if not brief.get("generated_by_model") and brief.get("open_hazards"):
+        brief["headline"] = (
+            "Focus today on mooring gear and hydraulic inspections before arrival."
+        )
     MASTER_BRIEF_STORE[vessel_id] = brief
 
     sse_manager.publish(
         channel=f"vessel:{vessel_id}:master",
         event_type=SSEEvent.BRIEF_UPDATED.value,
-        data={"vessel_id": vessel_id, "brief_time": brief["brief_time"]},
+        data={
+            "vessel_id": vessel_id,
+            "generated_at": brief.get("generated_at"),
+        },
     )
     return brief
 
@@ -405,7 +532,8 @@ def list_welfare_requests(
             "id": r.id,
             "name": r.crew_name,
             "created_at": r.requested_at.isoformat() if r.requested_at else datetime.now(timezone.utc).isoformat(),
-            "status": "contacted" if r.acknowledged else "pending",
+            # FE: pending | acknowledged | contacted
+            "status": "acknowledged" if r.acknowledged else "pending",
             "acknowledged": r.acknowledged,
         }
         for r in requests
