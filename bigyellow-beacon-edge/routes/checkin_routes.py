@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, SSEEvent
 from contract.uuid7 import uuid7_str
-from contract.models import CheckInTurnRequest
+from contract.models import CheckInTurnRequest, to_utc_iso
 from db_models import CheckinModel, WelfareRequestModel, DeviceModel, CrewAccountModel
 from config import VESSEL_ID
 from db import get_db
@@ -138,7 +138,7 @@ def submit_checkin(
             "sleep_hours": req.sleep_hours if req.sleep_hours is not None else 6.5,
             "tags": req.tags or [],
             "turns": [],
-            "created_at": now.isoformat(),
+            "created_at": to_utc_iso(now),
         }
         return {
             "id": checkin_id,
@@ -363,8 +363,8 @@ def request_master_welfare_check(
             "id": welfare_id,
             "name": crew_name,
             "crew_name": crew_name,
-            "created_at": req_row.requested_at.isoformat(),
-            "requested_at": req_row.requested_at.isoformat(),
+            "created_at": to_utc_iso(req_row.requested_at),
+            "requested_at": to_utc_iso(req_row.requested_at),
             "status": "pending",
         },
     )

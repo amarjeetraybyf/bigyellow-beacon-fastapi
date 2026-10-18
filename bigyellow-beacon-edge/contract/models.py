@@ -19,8 +19,40 @@ from contract.enums import (
 from contract.uuid7 import uuid7_str
 
 
+import re
+
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def to_utc_iso(dt: Optional[Any]) -> Optional[str]:
+    """
+    Ensures a datetime or ISO timestamp string is formatted as an explicit UTC ISO-8601 string ending with 'Z'.
+    Prevents browsers/clients in other timezones (e.g. IST UTC+05:30) from misinterpreting naive timestamps
+    as local time (which causes newly created items to appear as '6 hours ago').
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        s = dt.strip()
+        if not s:
+            return None
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T")
+        if s.endswith("Z"):
+            return s
+        if "+00:00" in s:
+            return s.replace("+00:00", "Z")
+        if re.search(r"[+-]\d{2}:\d{2}$", s):
+            return s
+        return s + "Z"
+    if hasattr(dt, "tzinfo"):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.isoformat().replace("+00:00", "Z")
+    return str(dt)
 
 
 def normalize_hazard_type(raw: Optional[str]) -> str:

@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, LearningStatus, PullChangeType
 from contract.uuid7 import uuid7_str
+from contract.models import to_utc_iso
 from db_models import (
     LearningModel,
     DailyAnchorCardModel,
@@ -215,9 +216,9 @@ def serialize_shore_learning(learning: LearningModel) -> Dict[str, Any]:
         "ai_drafted_fields": extra.get("ai_drafted_fields", []),
         "stats": stats,
         "version": learning.version or 1,
-        "created_at": learning.created_at.isoformat() if learning.created_at else None,
-        "updated_at": learning.updated_at.isoformat() if learning.updated_at else datetime.now(timezone.utc).isoformat(),
-        "published_at": published_at,
+        "created_at": to_utc_iso(learning.created_at),
+        "updated_at": to_utc_iso(learning.updated_at or datetime.now(timezone.utc)),
+        "published_at": to_utc_iso(published_at),
     }
     return res
 
@@ -260,8 +261,8 @@ def serialize_shore_anchor_card(card: DailyAnchorCardModel) -> Dict[str, Any]:
         "status": status_val,
         "translations": translations,
         "stats": stats,
-        "created_at": card.created_at.isoformat() if card.created_at else None,
-        "updated_at": card.updated_at.isoformat() if card.updated_at else None,
+        "created_at": to_utc_iso(card.created_at),
+        "updated_at": to_utc_iso(card.updated_at),
     }
 
 

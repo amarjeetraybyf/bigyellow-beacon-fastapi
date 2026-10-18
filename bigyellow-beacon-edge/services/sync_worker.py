@@ -28,7 +28,7 @@ from config import (
 from security import compute_sync_hmac
 from services.sse_manager import sse_manager
 from contract.enums import SSEEvent, ShoreStatus, LearningStatus, PullChangeType
-from contract.models import SyncDelta, SyncDeltaEvent
+from contract.models import SyncDelta, SyncDeltaEvent, to_utc_iso
 from db_models import (
     OutboxModel,
     TicketModel,
@@ -105,7 +105,7 @@ class SyncWorker:
 
         sse_manager.broadcast_sync_status(VESSEL_ID, {
             "link_status": self.link_status,
-            "last_sync": self.last_sync_timestamp.isoformat(),
+            "last_sync": to_utc_iso(self.last_sync_timestamp),
             "pushed_count": push_result.get("acked_count", 0),
             "pulled_count": pull_result.get("pulled_count", 0),
         })
@@ -115,7 +115,7 @@ class SyncWorker:
             "link_status": self.link_status,
             "push": push_result,
             "pull": pull_result,
-            "last_sync": self.last_sync_timestamp.isoformat(),
+            "last_sync": to_utc_iso(self.last_sync_timestamp),
         }
 
     async def _push_outbox(self, db: Session) -> Dict[str, Any]:
@@ -239,12 +239,21 @@ class SyncWorker:
                         msg_id = payload.get("message_id")
                         existing_m = db.query(TicketMessageModel).filter(TicketMessageModel.id == msg_id).first()
                         if not existing_m:
+                            msg_dt = datetime.now(timezone.utc)
+                            raw_created = payload.get("created_at")
+                            if raw_created:
+                                try:
+                                    msg_dt = datetime.fromisoformat(str(raw_created).replace("Z", "+00:00"))
+                                except Exception:
+                                    pass
                             new_m = TicketMessageModel(
                                 id=msg_id,
                                 ticket_id=payload.get("ticket_id"),
                                 sender_role="shore_reviewer",
                                 text=payload.get("text", ""),
                                 origin="shore",
+                                created_at=msg_dt,
+                                updated_at=msg_dt,
                             )
                             db.add(new_m)
                             db.commit()
@@ -256,6 +265,7 @@ class SyncWorker:
                                     "message_id": msg_id,
                                     "text": payload.get("text"),
                                     "sender_role": "shore_reviewer",
+                                    "created_at": to_utc_iso(raw_created or msg_dt),
                                 },
                                 vessel_id=VESSEL_ID,
                             )

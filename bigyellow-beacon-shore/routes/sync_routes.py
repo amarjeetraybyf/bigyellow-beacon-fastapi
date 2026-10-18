@@ -15,7 +15,7 @@ from fastapi import APIRouter, Request, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from contract.enums import PullChangeType, ShoreStatus, OnboardStatus
-from contract.models import SyncDelta, SyncPushResponse, SyncPullResponse, PullChange
+from contract.models import SyncDelta, SyncPushResponse, SyncPullResponse, PullChange, to_utc_iso
 from db_models import (
     VesselModel,
     ProcessedEventModel,
@@ -243,7 +243,7 @@ def pull_sync_changes(
             "change_type": r.change_type,
             "aggregate_id": r.aggregate_id,
             "payload": r.payload,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "created_at": to_utc_iso(r.created_at),
         }
         for r in returned_rows
     ]

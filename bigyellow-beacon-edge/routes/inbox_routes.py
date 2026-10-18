@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from db_models import InboxMessageModel
 from db import get_db
 from auth import get_current_edge_user
+from contract.models import to_utc_iso
 
 router = APIRouter(prefix="/inbox", tags=["Crew Inbox"])
 
@@ -60,7 +61,7 @@ def get_inbox(
             "body": m.body,
             "link": {"to": "/reports"},
             "read": m.read,
-            "created_at": m.created_at.isoformat() if m.created_at else "2026-10-17T00:00:00Z",
+            "created_at": to_utc_iso(m.created_at) or "2026-10-17T00:00:00Z",
         }
         for m in messages
     ]

@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, OnboardStatus, ShoreStatus, SSEEvent
 from contract.uuid7 import uuid7_str
-from contract.models import TicketFields, TicketStructureResponse, normalize_hazard_type, normalize_ism_category
+from contract.models import TicketFields, TicketStructureResponse, normalize_hazard_type, normalize_ism_category, to_utc_iso
 from db_models import TicketModel, OutboxModel, DeviceModel
 from config import VESSEL_ID, PORT
 from db import get_db
@@ -86,6 +86,12 @@ def ticket_to_dict(
                 act = dict(item)
                 if act.get("photo_url"):
                     act["photo_url"] = to_public_url(act["photo_url"])
+                if act.get("due_at"):
+                    act["due_at"] = to_utc_iso(act["due_at"])
+                if act.get("created_at"):
+                    act["created_at"] = to_utc_iso(act["created_at"])
+                elif act.get("assigned_at"):
+                    act["created_at"] = to_utc_iso(act["assigned_at"])
                 actions.append(act)
             if "share_name_with_master" in item:
                 if not r_name:
@@ -163,7 +169,7 @@ def ticket_to_dict(
         "onboard_status": onboard_status,
         "shore_status": shore_status,
         "actions": actions,
-        "created_at": (t.created_at or get_utc_now()).isoformat(),
+        "created_at": to_utc_iso(t.created_at or get_utc_now()),
         "queued_to_outbox": True,
         "message": "Report finalized and queued for satellite sync.",
     }
@@ -358,7 +364,7 @@ async def create_draft(
         "duration": audio_duration_val,
         "photos": processed_photos,
         "answers": [],
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": to_utc_iso(datetime.now(timezone.utc)),
     }
 
     return {
@@ -604,7 +610,7 @@ def finalize_report(
         "shore_status": ticket.shore_status,
         "assigned_action": ticket.assigned_action,
         "media_refs": ticket.media_refs,
-        "created_at": now.isoformat(),
+        "created_at": to_utc_iso(now),
         "origin": "edge",
         "version": 1,
     }

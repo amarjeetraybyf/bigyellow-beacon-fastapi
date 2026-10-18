@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from contract.enums import Role, ShoreStatus, PullChangeType
 from contract.uuid7 import uuid7_str
+from contract.models import to_utc_iso
 from db_models import TicketModel, TicketMessageModel, PullCursorModel, VesselModel
 from db import get_db
 from security import require_shore_role
@@ -123,11 +124,11 @@ def serialize_shore_ticket(t: TicketModel, db: Session) -> Dict[str, Any]:
             formatted_actions.append({
                 "text": a.get("text", ""),
                 "responsible_rank": a.get("responsible_rank", "2nd Engineer"),
-                "due_at": a.get("due_at"),
-                "created_at": a.get("created_at") or a.get("assigned_at") or (t.created_at.isoformat() if t.created_at else None),
+                "due_at": to_utc_iso(a.get("due_at")),
+                "created_at": to_utc_iso(a.get("created_at") or a.get("assigned_at") or t.created_at),
             })
 
-    occurred = t.created_at.isoformat() if t.created_at else None
+    occurred = to_utc_iso(t.created_at)
 
     # Map onboard_status to Lovable valid values
     obs = t.onboard_status
@@ -167,7 +168,7 @@ def serialize_shore_ticket(t: TicketModel, db: Session) -> Dict[str, Any]:
         "occurred_at": occurred,
         "received_at": occurred,
         "created_at": occurred,
-        "updated_at": t.updated_at.isoformat() if t.updated_at else occurred,
+        "updated_at": to_utc_iso(t.updated_at) or occurred,
     }
 
 
@@ -266,8 +267,8 @@ def get_shore_ticket_detail(
             "shore_user_name": "Shore Safety Team" if "shore" in m.sender_role else None,
             "body": m.text,
             "text": m.text,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "delivered_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": to_utc_iso(m.created_at),
+            "delivered_at": to_utc_iso(m.created_at),
         }
         for m in messages
     ]
@@ -498,8 +499,8 @@ def get_ticket_messages(
             "shore_user_name": "Shore Safety Team" if "shore" in m.sender_role else None,
             "body": m.text,
             "text": m.text,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "delivered_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": to_utc_iso(m.created_at),
+            "delivered_at": to_utc_iso(m.created_at),
         }
         for m in messages
     ]
@@ -524,12 +525,15 @@ def post_ticket_reply(
         raise HTTPException(status_code=400, detail={"error": "Message body cannot be empty"})
 
     user_name = get_user_name(user)
+    now_utc = datetime.now(timezone.utc)
     msg = TicketMessageModel(
         id=uuid7_str(),
         ticket_id=ticket.id,
         sender_role=Role.SHORE_REVIEWER.value,
         text=msg_text,
         origin="shore",
+        created_at=now_utc,
+        updated_at=now_utc,
     )
     db.add(msg)
 
@@ -546,7 +550,7 @@ def post_ticket_reply(
             "shore_user_name": user_name,
             "body": msg.text,
             "text": msg.text,
-            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            "created_at": to_utc_iso(now_utc),
         },
     )
     db.add(change)
@@ -569,7 +573,7 @@ def post_ticket_reply(
         "shore_user_name": user_name,
         "body": msg.text,
         "text": msg.text,
-        "created_at": msg.created_at.isoformat(),
+        "created_at": to_utc_iso(msg.created_at or now_utc),
         "delivered_at": None,
     }
 
@@ -630,7 +634,7 @@ def analyze_ticket_copilot(
     return {
         "ticket_id": ticket.id,
         "model": ai_raw.get("model", "deterministic-fallback"),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": to_utc_iso(datetime.now(timezone.utc)),
         "summary": summary_list,
         "contributing_factors": [
             f"Operation in {ticket.location_on_board or 'shipboard area'}",
