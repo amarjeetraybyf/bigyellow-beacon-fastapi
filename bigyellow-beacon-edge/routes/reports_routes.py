@@ -586,6 +586,7 @@ def finalize_report(
         media_refs=media_refs_list,
         created_at=now,
         updated_at=now,
+        version=1,
     )
 
     outbox_payload = {
@@ -599,11 +600,13 @@ def finalize_report(
         "ism_category": ticket.ism_category,
         "severity": ticket.severity,
         "immediate_action": ticket.immediate_action,
+        "onboard_status": ticket.onboard_status,
         "shore_status": ticket.shore_status,
+        "assigned_action": ticket.assigned_action,
         "media_refs": ticket.media_refs,
         "created_at": now.isoformat(),
         "origin": "edge",
-        "version": ticket.version,
+        "version": 1,
     }
 
     outbox_entry = OutboxModel(

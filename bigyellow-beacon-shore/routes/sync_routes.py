@@ -26,6 +26,7 @@ from db_models import (
 )
 from db import get_db
 from security import verify_vessel_sync_request
+from logging_config import logger
 
 router = APIRouter(prefix="/sync", tags=["Shore Synchronization"])
 
@@ -131,30 +132,30 @@ async def push_sync_delta(
                         location_on_board=payload.get("location_on_board", ""),
                         hazard_type=payload.get("hazard_type", ""),
                         ism_category=payload.get("ism_category", ""),
-                        severity=int(payload.get("severity", 3)),
+                        severity=int(payload.get("severity") or 3),
                         immediate_action=payload.get("immediate_action", ""),
-                        onboard_status=payload.get("onboard_status", OnboardStatus.NEW.value),
+                        onboard_status=payload.get("onboard_status") or OnboardStatus.NEW.value,
                         shore_status=ShoreStatus.NEW.value,  # Shore owns shore_status
                         assigned_action=payload.get("assigned_action"),
-                        media_refs=payload.get("media_refs", []),
+                        media_refs=payload.get("media_refs") or [],
                         origin="edge",
-                        version=int(payload.get("version", 1)),
+                        version=int(payload.get("version") or 1),
                     )
                     db.add(ticket)
                     db.flush()
                 else:
-                    if "onboard_status" in payload:
+                    if "onboard_status" in payload and payload["onboard_status"]:
                         ticket.onboard_status = payload["onboard_status"]
                     if "assigned_action" in payload:
                         ticket.assigned_action = payload["assigned_action"]
                     if "immediate_action" in payload:
                         ticket.immediate_action = payload["immediate_action"]
                     if "media_refs" in payload:
-                        ticket.media_refs = payload["media_refs"]
-                    ticket.version += 1
+                        ticket.media_refs = payload["media_refs"] or []
+                    ticket.version = int(payload.get("version") or (ticket.version + 1))
                     db.flush()
 
-            elif event_type in ("ticket.message", "message.new"):
+            elif event_type in ("ticket.message", "ticket_message", "message.new"):
                 msg_id = ev.aggregate_id or payload.get("id")
                 existing_msg = db.query(TicketMessageModel).filter(TicketMessageModel.id == msg_id).first()
                 if not existing_msg:
@@ -169,7 +170,7 @@ async def push_sync_delta(
                     db.flush()
 
             elif event_type == "checkin.aggregate":
-                sample_count = int(payload.get("count", 0))
+                sample_count = int(payload.get("count") or 0)
                 if sample_count >= 5:
                     agg = CheckinAggregateModel(
                         id=ev.aggregate_id or payload.get("id"),
@@ -177,9 +178,9 @@ async def push_sync_delta(
                         ship_date=payload.get("ship_date", datetime.now(timezone.utc).strftime("%Y-%m-%d")),
                         department=payload.get("department", "All"),
                         count=sample_count,
-                        avg_mood=float(payload.get("avg_mood", 3.0)),
-                        avg_fatigue=float(payload.get("avg_fatigue", 3.0)),
-                        avg_workload=float(payload.get("avg_workload", 3.0)),
+                        avg_mood=float(payload.get("avg_mood") or 3.0),
+                        avg_fatigue=float(payload.get("avg_fatigue") or 3.0),
+                        avg_workload=float(payload.get("avg_workload") or 3.0),
                         origin="edge",
                     )
                     db.add(agg)
@@ -193,7 +194,8 @@ async def push_sync_delta(
             db.flush()
             acked_ids.append(event_id)
 
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error ingesting sync event {event_id} ({getattr(ev, 'event_type', 'unknown')}): {e}", exc_info=True)
             rejected_ids.append(event_id)
 
     db.commit()
