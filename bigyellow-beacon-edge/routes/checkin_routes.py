@@ -297,6 +297,7 @@ def request_master_welfare_check(
     device_id = user.get("device_id")
 
     account = db.query(CrewAccountModel).filter(CrewAccountModel.id == crew_id).first() if crew_id else None
+    device = db.query(DeviceModel).filter(DeviceModel.id == device_id).first() if device_id else None
     crew_name = account.name if account else (device.crew_name if device and device.crew_name else resolve_crew_name(crew_id))
 
     welfare_id = uuid7_str()

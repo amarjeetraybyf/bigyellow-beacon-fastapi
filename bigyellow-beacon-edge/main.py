@@ -22,8 +22,10 @@ from routes.ticket_messages_routes import router as ticket_messages_router
 from routes.inbox_routes import router as inbox_router
 from routes.events_routes import router as events_router
 from routes.checkin_routes import router as checkin_router
+import asyncio
 from routes.learnings_routes import router as learnings_router
 from routes.sync_routes import router as sync_router
+from services.sync_worker import sync_worker
 
 
 @asynccontextmanager
@@ -34,7 +36,14 @@ async def lifespan(app: FastAPI):
     print(f"📡 Local Port: http://{HOST}:{PORT}")
     print(f"📄 Swagger UI: http://{HOST}:{PORT}{ROOT_PATH}/docs")
     print("================================================================")
+    # Launch autonomous Edge-to-Shore sync engine in background
+    sync_task = asyncio.create_task(sync_worker.run_forever())
     yield
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

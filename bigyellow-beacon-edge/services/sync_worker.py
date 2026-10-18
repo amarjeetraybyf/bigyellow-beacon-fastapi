@@ -12,6 +12,7 @@ import os
 import time
 import gzip
 import json
+import asyncio
 import httpx
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -45,6 +46,7 @@ class SyncWorker:
         self.last_sync_timestamp: Optional[datetime] = None
         self.last_cursor: int = 0
         self.backoff_seconds: float = 5.0
+        self.is_running: bool = False
         self.override: str = os.getenv("BEACON_LINK_OVERRIDE", BEACON_LINK_OVERRIDE).lower()
 
     def set_override(self, override: str):
@@ -216,14 +218,18 @@ class SyncWorker:
                     if change_type == PullChangeType.TICKET_SHORE_STATUS.value:
                         ticket_id = payload.get("ticket_id")
                         t = db.query(TicketModel).filter(TicketModel.id == ticket_id).first()
-                        if t and "shore_status" in payload:
-                            t.shore_status = payload["shore_status"]
+                        if t:
+                            if "shore_status" in payload:
+                                t.shore_status = payload["shore_status"]
+                            if "assigned_action" in payload:
+                                t.assigned_action = payload["assigned_action"]
                             t.version += 1
                             db.commit()
-                            sse_manager.publish(
-                                f"vessel:{VESSEL_ID}:master",
+                            # Broadcast to both Master and all connected crew devices on ship LAN
+                            sse_manager.broadcast_event(
                                 SSEEvent.TICKET_UPDATED,
-                                {"ticket_id": t.id, "shore_status": t.shore_status},
+                                {"ticket_id": t.id, "shore_status": t.shore_status, "assigned_action": t.assigned_action},
+                                vessel_id=VESSEL_ID,
                             )
 
                     elif change_type == PullChangeType.TICKET_MESSAGE.value:
@@ -239,10 +245,16 @@ class SyncWorker:
                             )
                             db.add(new_m)
                             db.commit()
-                            sse_manager.publish(
-                                f"vessel:{VESSEL_ID}:master",
+                            # Broadcast incoming shore reply to crew & master apps
+                            sse_manager.broadcast_event(
                                 SSEEvent.MESSAGE_NEW,
-                                {"ticket_id": payload.get("ticket_id"), "text": payload.get("text")},
+                                {
+                                    "ticket_id": payload.get("ticket_id"),
+                                    "message_id": msg_id,
+                                    "text": payload.get("text"),
+                                    "sender_role": "shore_reviewer",
+                                },
+                                vessel_id=VESSEL_ID,
                             )
 
                     elif change_type == PullChangeType.LEARNING_PUBLISHED.value:
@@ -267,10 +279,10 @@ class SyncWorker:
                             learn.status = LearningStatus.PUBLISHED.value
                             learn.media = payload.get("media", learn.media)
                         db.commit()
-                        sse_manager.publish(
-                            f"vessel:{VESSEL_ID}:master",
+                        sse_manager.broadcast_event(
                             SSEEvent.LEARNING_NEW,
                             {"learning_id": l_id, "title": payload.get("title")},
+                            vessel_id=VESSEL_ID,
                         )
 
                     elif change_type == PullChangeType.LEARNING_RETRACTED.value:
@@ -294,15 +306,76 @@ class SyncWorker:
                             )
                             db.add(card)
                         db.commit()
-                        sse_manager.publish(
-                            f"vessel:{VESSEL_ID}:master",
+                        sse_manager.broadcast_event(
                             SSEEvent.ANCHOR_NEW,
                             {"anchor_id": card_id, "topic": payload.get("topic")},
+                            vessel_id=VESSEL_ID,
                         )
 
                 return {"pulled_count": len(changes), "next_cursor": data.get("next_cursor")}
         except Exception as e:
             return {"error": f"Pull failed: {str(e)}"}
+
+    async def run_forever(self):
+        """
+        Autonomous background loop for Edge Sync Worker.
+        - Continually probes link state to Shore backend.
+        - When link is UP (satellite online or local network connected):
+          Executes push of unsynced Outbox events and pulls Shore changes.
+          Maintains an active burst window (polls Shore every 10s while link remains stable).
+        - When link is DOWN (offline at sea):
+          Backs off gracefully (probe sleep between 10s and 60s) with low-overhead probes.
+        - Cleanly terminates on application shutdown via asyncio.CancelledError.
+        """
+        self.is_running = True
+        print(f"🛰️  [SyncWorker] Autonomous sync worker started for vessel: {VESSEL_ID}")
+        print(f"🔗  [SyncWorker] Target Shore URL: {SHORE_URL}")
+
+        prev_link_status = self.link_status
+
+        try:
+            while True:
+                try:
+                    is_up = await self.probe_link()
+
+                    if is_up != (prev_link_status == "UP"):
+                        if is_up:
+                            print("🟢 [SyncWorker] Satellite/Shore Link is UP! Starting immediate sync burst.")
+                        else:
+                            print("🔴 [SyncWorker] Satellite/Shore Link is DOWN. Operating in offline outbox mode.")
+                        prev_link_status = self.link_status
+
+                    if is_up:
+                        # Link is UP: Execute sync cycle with a dedicated DB session
+                        from db import SessionLocal
+                        db = SessionLocal()
+                        try:
+                            sync_res = await self.execute_sync(db)
+                            pushed = sync_res.get("push", {}).get("acked_count", 0)
+                            pulled = sync_res.get("pull", {}).get("pulled_count", 0)
+                            if pushed > 0 or pulled > 0:
+                                print(f"⚡ [SyncWorker] Synced: pushed={pushed} events, pulled={pulled} changes.")
+                        except Exception as sync_err:
+                            print(f"⚠️  [SyncWorker] Sync execution error: {sync_err}")
+                        finally:
+                            db.close()
+
+                        # Active burst window: poll Shore every 10 seconds while link is UP
+                        await asyncio.sleep(10.0)
+                    else:
+                        # Link is DOWN: sleep with backoff (between 10s and 60s)
+                        sleep_time = max(10.0, min(self.backoff_seconds, 60.0))
+                        await asyncio.sleep(sleep_time)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as loop_err:
+                    print(f"⚠️  [SyncWorker] Background loop error: {loop_err}")
+                    await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            print("🛑 [SyncWorker] Sync worker background task terminated.")
+        finally:
+            self.is_running = False
 
 
 sync_worker = SyncWorker()

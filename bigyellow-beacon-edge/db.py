@@ -4,7 +4,7 @@ Supports PostgreSQL 16 and SQLite fallback for shipboard zero-maintenance resili
 """
 
 from typing import Generator
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 
 from db_models import Base
@@ -29,6 +29,18 @@ def create_edge_engine(db_url: str):
 
 
 engine = create_edge_engine(DATABASE_URL)
+
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    """Enable Write-Ahead Logging (WAL) and non-blocking reads/writes for shipboard SQLite resilience."""
+    if engine.url.drivername.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

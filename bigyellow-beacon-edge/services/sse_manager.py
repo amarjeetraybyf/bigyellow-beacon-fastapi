@@ -32,9 +32,10 @@ class SSEManager:
         self._max_buffer = max_buffer_size
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
 
-    def publish(self, channel: str, event_type: str, data: Dict[str, Any]) -> int:
+    def publish(self, channel: str, event_type: Any, data: Dict[str, Any]) -> int:
+        evt_str = event_type.value if hasattr(event_type, "value") else str(event_type)
         self._counter += 1
-        msg = SSEMessage(self._counter, channel, event_type, data)
+        msg = SSEMessage(self._counter, channel, evt_str, data)
         self._history.append(msg)
         if len(self._history) > self._max_buffer:
             self._history.pop(0)
@@ -60,6 +61,21 @@ class SSEManager:
         for ch in list(self._subscribers.keys()):
             if ch != f"vessel:{vessel_id}:master":
                 self.publish(ch, "sync.status", data)
+
+    def broadcast_event(self, event_type: str, data: Dict[str, Any], vessel_id: Optional[str] = None) -> None:
+        """
+        Broadcasts an event to the vessel master history and all active crew subscribers.
+        Ensures both Master officers and connected crew app users receive real-time updates.
+        """
+        if vessel_id:
+            master_channel = f"vessel:{vessel_id}:master"
+            self.publish(master_channel, event_type, data)
+            for ch in list(self._subscribers.keys()):
+                if ch != master_channel:
+                    self.publish(ch, event_type, data)
+        else:
+            for ch in list(self._subscribers.keys()):
+                self.publish(ch, event_type, data)
 
     async def subscribe(
         self, channel: str, last_event_id: Optional[int] = None
