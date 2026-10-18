@@ -405,7 +405,8 @@ def list_welfare_requests(
             "id": r.id,
             "name": r.crew_name,
             "created_at": r.requested_at.isoformat() if r.requested_at else datetime.now(timezone.utc).isoformat(),
-            "status": "contacted" if r.acknowledged else "pending",
+            # FE: pending | acknowledged | contacted
+            "status": "acknowledged" if r.acknowledged else "pending",
             "acknowledged": r.acknowledged,
         }
         for r in requests
