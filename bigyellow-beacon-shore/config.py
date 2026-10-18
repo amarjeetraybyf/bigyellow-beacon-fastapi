@@ -31,3 +31,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Reverse Proxy / Gateway subpath prefix (e.g. "/shore" if hosted behind API gateway)
 ROOT_PATH = os.getenv("ROOT_PATH", os.getenv("SHORE_ROOT_PATH", ""))
+
+# Application Logging Settings
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG" if DEBUG else "INFO").upper()
+LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", str(BASE_DIR / "logs" / "shore_app.log"))
+
