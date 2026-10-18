@@ -73,3 +73,23 @@ class LinkOverride(str, Enum):
     AUTO = "auto"
     UP = "up"
     DOWN = "down"
+
+
+# Frontend report contract enums (must match UI ReportFields exactly)
+class HazardType(str, Enum):
+    SLIP_TRIP_FALL = "slip_trip_fall"
+    MOORING = "mooring"
+    CRANE_LIFTING = "crane_lifting"
+    ENCLOSED_SPACE = "enclosed_space"
+    FIRE = "fire"
+    MACHINERY = "machinery"
+    ELECTRICAL = "electrical"
+    CHEMICAL = "chemical"
+    OTHER = "other"
+
+
+class IsmCategory(str, Enum):
+    UNSAFE_ACT = "unsafe_act"
+    UNSAFE_CONDITION = "unsafe_condition"
+    EQUIPMENT_FAILURE = "equipment_failure"
+    PROCEDURE_GAP = "procedure_gap"

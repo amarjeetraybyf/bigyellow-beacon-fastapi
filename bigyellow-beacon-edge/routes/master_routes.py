@@ -38,6 +38,7 @@ from db import get_db
 from auth import require_edge_role
 from security import hash_pin_argon2
 from services.sse_manager import sse_manager
+from services.ai_gateway import ai_gateway
 from services.pii_scrub import strip_exif
 from routes.reports_routes import ticket_to_dict, to_public_url, UPLOADS_DIR
 from routes.auth_routes import ensure_default_crew_roster
@@ -270,7 +271,7 @@ async def assign_or_resolve_action(
     return ticket_to_dict(ticket)
 
 
-def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
+async def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
     open_tickets = db.query(TicketModel).filter(
         TicketModel.vessel_id == vessel_id,
         TicketModel.onboard_status != OnboardStatus.RESOLVED_ON_BOARD.value,
@@ -278,7 +279,7 @@ def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
     ).all()
 
     now = datetime.now(timezone.utc)
-    return {
+    brief = {
         "brief": "06:00 UTC Daily Master Brief",
         "vessel_id": vessel_id,
         "brief_time": "06:00 UTC",
@@ -308,9 +309,32 @@ def build_morning_brief(vessel_id: str, db: Session) -> Dict[str, Any]:
         "updated_at": now.isoformat(),
     }
 
+    # Enrich narrative sections with the local Ollama model (gemma3n:e4b).
+    # Anonymized hazard data only - no crew names, ranks, or sentiments.
+    hazard_summary_lines = [
+        f"- severity {t.severity}: {t.title} ({t.hazard_type}, {t.location_on_board}, status {t.onboard_status})"
+        for t in open_tickets[:10]
+    ]
+    hazard_summary = (
+        f"Open near-miss hazards on board ({len(open_tickets)} total):\n" + "\n".join(hazard_summary_lines)
+        if hazard_summary_lines
+        else "No open near-miss hazards on board. Quiet watch overnight."
+    )
+    ai_brief = await ai_gateway.generate_master_brief(hazard_summary)
+    if ai_brief:
+        if ai_brief.get("headline"):
+            brief["headline"] = ai_brief["headline"]
+        if ai_brief.get("recommended_action"):
+            brief["recommended_action"] = ai_brief["recommended_action"]
+        if ai_brief.get("fleet_context"):
+            brief["fleet_context"] = ai_brief["fleet_context"]
+        brief["generated_by_model"] = "ollama"
+
+    return brief
+
 
 @router.get("/brief")
-def get_master_brief(
+async def get_master_brief(
     user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
     db: Session = Depends(get_db),
 ):
@@ -318,20 +342,21 @@ def get_master_brief(
     vessel_id = user.get("vessel_id", VESSEL_ID)
     brief = MASTER_BRIEF_STORE.get(vessel_id)
     if not brief:
-        brief = build_morning_brief(vessel_id, db)
+        brief = await build_morning_brief(vessel_id, db)
         MASTER_BRIEF_STORE[vessel_id] = brief
     return brief
 
 
 @router.post("/brief/regenerate")
-def regenerate_master_brief(
+async def regenerate_master_brief(
     user: Dict[str, Any] = Depends(require_edge_role(Role.MASTER)),
     db: Session = Depends(get_db),
 ):
     """Rebuild Master's 06:00 brief using current shipboard tickets and aggregates."""
     vessel_id = user.get("vessel_id", VESSEL_ID)
-    brief = build_morning_brief(vessel_id, db)
-    brief["headline"] = "Focus today on mooring gear and hydraulic inspections before arrival."
+    brief = await build_morning_brief(vessel_id, db)
+    if not brief.get("generated_by_model"):
+        brief["headline"] = "Focus today on mooring gear and hydraulic inspections before arrival."
     MASTER_BRIEF_STORE[vessel_id] = brief
 
     sse_manager.publish(
